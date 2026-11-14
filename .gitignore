@@ -1,5 +1,7 @@
 # 从 IBKR 读取并保存在本机的行情数据，不上传
 options_data/
+backtest_data/
+backtest_range_*.html
 *.json
 
 # Python

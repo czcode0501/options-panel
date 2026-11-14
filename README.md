@@ -48,6 +48,21 @@ python options_panel.py --demo
 
 演示模式使用程序生成的模拟数据，用来看界面和功能，数字没有参考意义。
 
+## 波动范围回测
+
+`backtest_range.py` 用来检验看板里的波动范围准不准：对过去每一个交易日，用当天的隐含波动率算出之后一段时间的 68% 和 95% 范围，再统计实际价格落在范围内的比例。
+
+```
+python backtest_range.py            # 回测 QQQ，最近 5 年
+python backtest_range.py NVDA       # 回测别的代码
+python backtest_range.py QQQ 10     # 回测最近 10 年
+python backtest_range.py --demo     # 不连接 IBKR，用模拟数据看报告的样子
+```
+
+运行前需要登录 IB Gateway。价格和隐含波动率历史都从 IBKR 读取；QQQ、SPY、IWM、DIA 在 IBKR 取不到隐含波动率历史时，改用 Cboe 公布的波动率指数。结果生成一个网页报告并自动打开。
+
+这个回测只检验范围的宽窄，不涉及涨跌方向，也不检验 Call 墙、Put 墙等持仓价位（后者需要历史持仓量数据）。
+
 ## 设置
 
 在 `options_panel.py` 开头可以修改：

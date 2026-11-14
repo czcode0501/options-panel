@@ -20,8 +20,9 @@ CLIENT_ID = 11
 MARKET_DATA_TYPE = 4     # 4 = 没有实时订阅时用延迟/收盘冻结数据
 BATCH = 90               # 账户同时只能订阅约 100 张合约，所以分批读取
 # K 线周期：(看板里的名字, IBKR 的周期, 读取多长的历史)
-BAR_SETS = [("15m", "15 mins", "30 D"), ("30m", "30 mins", "60 D"), ("1h", "1 hour", "120 D"),
-            ("2h", "2 hours", "1 Y"), ("1d", "1 day", "5 Y")]
+# 最后一项是备用的较短历史：较长的那次读取失败时改用它
+BAR_SETS = [("15m", "15 mins", "60 D", "30 D"), ("30m", "30 mins", "120 D", "60 D"),
+            ("1h", "1 hour", "1 Y", "120 D"), ("2h", "2 hours", "2 Y", "1 Y"), ("1d", "1 day", "5 Y", "2 Y")]
 # 可以在看板里选来对比的波动率指数
 INDEXES = ("VIX", "VXN", "RVX", "VXD", "VIX9D", "VIX3M")
 DEMO = "--demo" in sys.argv   # 演示模式：不连接 IBKR，用模拟数据
@@ -71,7 +72,7 @@ def get_cached(symbol, days=0):
                 cache[symbol] = d
         except (OSError, ValueError):
             d = None
-    if d is not None and d.get("v") != 3:
+    if d is not None and d.get("v") != 4:
         return None
     if d is not None and d.get("generated", "")[:10] != date.today().isoformat():
         return None
@@ -175,17 +176,21 @@ def fetch(ib, symbol, days):
         raise RuntimeError("在 IBKR 里找不到代码 " + symbol + "，请检查拼写（目前只支持美股和 ETF）")
 
     t = ib.reqTickers(stk)[0]
-    bar = lambda b: [str(b.date)[:16], b.open, b.high, b.low, b.close]
+    bar = lambda b: [str(b.date)[:16], b.open, b.high, b.low, b.close, clean(b.volume) or 0]
     bars = {}
-    for n, (key, size, dur) in enumerate(BAR_SETS):
+    for n, (key, size, dur, shorter) in enumerate(BAR_SETS):
         set_state(msg=f"正在读取 K 线：{n + 1}/{len(BAR_SETS)}")
-        try:
-            got = ib.reqHistoricalData(stk, endDateTime="", durationStr=dur, barSizeSetting=size,
-                                       whatToShow="TRADES", useRTH=True)
-        except ConnectionError:
-            raise
-        except Exception:
-            got = []
+        got = []
+        for d in (dur, shorter):
+            try:
+                got = ib.reqHistoricalData(stk, endDateTime="", durationStr=d, barSizeSetting=size,
+                                           whatToShow="TRADES", useRTH=True)
+            except ConnectionError:
+                raise
+            except Exception:
+                got = []
+            if got:
+                break
         bars[key] = [bar(b) for b in got]
     daily = bars["1d"]
     set_state(msg="正在读取隐含波动率历史")
@@ -256,7 +261,7 @@ def fetch(ib, symbol, days):
                          clean(tk.bid), clean(tk.ask), clean(tk.last), iv, clean(tk.volume)])
             ib.cancelMktData(c)
 
-    return {"v": 3, "symbol": symbol, "price": price,
+    return {"v": 4, "symbol": symbol, "price": price,
             "generated": datetime.now().isoformat(timespec="minutes"),
             "max_days": days, "bars": bars, "vol": vol_hist, "rows": rows}
 
@@ -283,7 +288,8 @@ def demo_fetch(symbol, days):
             hi, lo = max(o, p) * (1 + abs(rnd.gauss(0, step / 2))), min(o, p) * (1 - abs(rnd.gauss(0, step / 2)))
             out.append([(now - dt * (n - i)).strftime(fmt), o, hi, lo, p])
         k = S / out[-1][4]
-        return [[b[0]] + [round(x * k, 2) for x in b[1:]] for b in out]
+        return [[b[0]] + [round(x * k, 2) for x in b[1:]] + [round(abs(rnd.gauss(1, 0.5)) * 2e6 * step / 0.004)]
+                for b in out]
 
     today, rows, exps = date.today(), [], []
     for d in range(1, days + 1):
@@ -312,7 +318,7 @@ def demo_fetch(symbol, days):
             "1d": series(1260, 0.012, "%Y-%m-%d", timedelta(days=1))}
     vol_hist = [[b[0], b[4], round(vol + 0.06 * math.sin(i / 45) + rnd.gauss(0, 0.006), 4)]
                 for i, b in enumerate(bars["1d"])]
-    return {"v": 3, "symbol": symbol, "price": round(S * 0.995, 2),
+    return {"v": 4, "symbol": symbol, "price": round(S * 0.995, 2),
             "generated": datetime.now().isoformat(timespec="minutes"), "max_days": days,
             "bars": bars, "vol": vol_hist, "rows": rows}
 
@@ -511,7 +517,7 @@ input[type=range]{width:100%;accent-color:var(--accent)}
 .tile .d{font-size:12px;color:var(--muted)}
 .up{color:var(--up)} .down{color:var(--down)}
 .chartwrap{position:relative}
-canvas{width:100%;height:660px;display:block}
+canvas{width:100%;height:740px;display:block}
 canvas.volcv{height:340px;cursor:crosshair}
 .tipbox{position:absolute;top:8px;pointer-events:none;background:var(--panel);border:1px solid var(--line);border-radius:6px;padding:8px 10px;font-size:12px;display:none;box-shadow:0 2px 8px rgba(0,0,0,.15);white-space:nowrap}
 .tipbox b{font-family:var(--num)}
@@ -599,6 +605,7 @@ ul{margin:0;padding-left:18px;display:flex;flex-direction:column;gap:4px;font-si
       <button class="btn chip" type="button" data-q="30">近 1 个月</button>
       <button class="btn chip" type="button" data-q="90">近 3 个月</button>
       <button class="btn chip" type="button" data-q="365">近 1 年</button>
+      <button class="btn chip" type="button" id="tg-vp" aria-pressed="true">成交量分布</button>
     </div>
     <div class="sub" id="k-note"></div>
     <div class="chartwrap"><canvas id="cv"></canvas><div id="tip"></div></div>
@@ -609,6 +616,7 @@ ul{margin:0;padding-left:18px;display:flex;flex-direction:column;gap:4px;font-si
       <span><i style="background:var(--muted);opacity:.25"></i>价值区（70% 的持仓）</span>
       <span>在 K 线上滚动鼠标滚轮可以缩放；鼠标移到 K 线或横条上看明细</span>
     </div>
+    <div class="sub">K 线下方的柱子是每根 K 线的成交量。K 线右侧的灰色横条是所显示这段 K 线的成交量按价位的分布，它会随 K 线的周期和起始日期变化；最长的那一条是这段时间成交最密集的价位，价格回到那里时容易遇到支撑或阻力。</div>
     <div class="sub">左边的 K 线是过去的价格，用上方的 K 线周期和起始日期调整。右边的持仓分布是今天还没到期的期权，用页面上方“期权到期日的时间范围”的两个滑块调整，改 K 线的时间不会改变它。
     </div>
   </section>
@@ -763,6 +771,8 @@ const TFN={'15m':'15 分钟','30m':'30 分钟','1h':'1 小时','2h':'2 小时','
 let tf='1h', viewN=140, curSymbol='', pendingForce=false, pollTimer=null;
 
 const f2=x=>x.toFixed(2), f0=x=>Math.round(x).toLocaleString('en-US');
+const fvol=v=>v>=1e9?(v/1e9).toFixed(2)+'B':v>=1e6?(v/1e6).toFixed(1)+'M':v>=1e3?(v/1e3).toFixed(0)+'K':String(Math.round(v));
+let showVP=true;
 const pct=(v,ref)=>((v/ref-1)*100>=0?'+':'')+((v/ref-1)*100).toFixed(1)+'%';
 const dstr=e=>e.slice(0,4)+'-'+e.slice(4,6)+'-'+e.slice(6,8);
 const wk=e=>'日一二三四五六'[new Date(+e.slice(0,4),+e.slice(4,6)-1,+e.slice(6,8)).getDay()];
@@ -914,7 +924,9 @@ function draw(){
   else if(ks.length){ y0=Math.min(y0,ks[0]); y1=Math.max(y1,ks[ks.length-1]); }
   if(!isFinite(y0)){ y0=D.price*0.9; y1=D.price*1.1; }
   const padY=(y1-y0)*0.03; y0-=padY; y1+=padY;
-  const L=58, R=Math.min(215,W*0.24), T=24, B=30, PW=W-L-R, PH=H-T-B;
+  const hasVol=bars.some(b=>b[5]>0), volH=hasVol?78:0;
+  const L=58, R=Math.min(215,W*0.24), T=24, B=30+(hasVol?volH+12:0), PW=W-L-R, PH=H-T-B;
+  let volPoc=null;
   const hw=bars.length?PW*0.55:0, gap=bars.length?14:0, px0=L+hw+gap, pw=PW-hw-gap;
   const py=v=>T+PH-(v-y0)/(y1-y0)*PH;
   geo={py:py,y0:y0,y1:y1,T:T,PH:PH,px0:px0,pw:pw,L:L,hw:hw,bars:bars};
@@ -932,6 +944,36 @@ function draw(){
   // K 线
   if(bars.length){
     const n=bars.length, cw=hw/n, bw=Math.max(1,Math.min(cw*0.7,14));
+    if(hasVol){
+      // 所显示这段 K 线的成交量按价位的分布（每根 K 线的成交量平均摊到它的最低价和最高价之间）
+      if(showVP){
+        const nb=80, bin=(y1-y0)/nb, vp=new Array(nb).fill(0);
+        bars.forEach(function(b){
+          const a=Math.max(0,Math.min(nb-1,Math.floor((b[3]-y0)/bin))), z=Math.max(0,Math.min(nb-1,Math.floor((b[2]-y0)/bin)));
+          for(let k=a;k<=z;k++) vp[k]+=(b[5]||0)/(z-a+1);
+        });
+        const mv=Math.max(...vp); let pk=0;
+        if(mv>0){
+          vp.forEach(function(v,k){ if(v>vp[pk]) pk=k; });
+          vp.forEach(function(v,k){
+            const w=v/mv*hw*0.3, yb=py(y0+(k+1)*bin);
+            g.fillStyle=muted; g.globalAlpha=k===pk?0.42:0.2; g.fillRect(L+hw-w,yb,w,Math.max(1,py(y0+k*bin)-yb-0.5));
+          });
+          g.globalAlpha=1; volPoc=y0+(pk+0.5)*bin;
+        }
+      }
+      // 每根 K 线的成交量
+      const vmax=Math.max(...bars.map(b=>b[5]||0)), vy=T+PH+12;
+      bars.forEach(function(b,i){
+        const hgt=(b[5]||0)/vmax*volH;
+        g.fillStyle=css(b[4]>=b[1]?'--up':'--down'); g.globalAlpha=0.6;
+        g.fillRect(L+cw*(i+0.5)-bw/2,vy+volH-hgt,bw,hgt);
+      });
+      g.globalAlpha=1; g.strokeStyle=line; g.lineWidth=1;
+      g.beginPath(); g.moveTo(L,vy+volH); g.lineTo(L+hw,vy+volH); g.stroke();
+      g.fillStyle=muted; g.font='11px '+css('--num'); g.textAlign='right'; g.textBaseline='top';
+      g.fillText(fvol(vmax),L-6,vy); g.textBaseline='bottom'; g.fillText('成交量',L-6,vy+volH);
+    }
     bars.forEach((b,i)=>{
       const x=L+cw*(i+0.5), up=b[4]>=b[1], col=css(up?'--up':'--down');
       g.strokeStyle=col; g.fillStyle=col; g.lineWidth=1;
@@ -941,7 +983,7 @@ function draw(){
     });
     g.fillStyle=muted; g.textAlign='center'; g.textBaseline='top'; g.font='11px '+css('--num');
     const step=Math.max(1,Math.floor(n/6));
-    for(let i=0;i<n;i+=step) g.fillText(bars[i][0].slice(5,10),L+cw*(i+0.5),T+PH+8);
+    for(let i=0;i<n;i+=step) g.fillText(n>300 && tf==='1d'?bars[i][0].slice(0,7):bars[i][0].slice(5,10),L+cw*(i+0.5),H-22);
     g.textAlign='left'; g.font='12px '+css('--font');
     g.fillText(TFN[tf]+' K 线，'+bars[0][0].slice(0,10)+' 起，共 '+n+' 根',L+4,T-19);
     g.strokeStyle=line; g.beginPath(); g.moveTo(px0-gap/2,T); g.lineTo(px0-gap/2,T+PH); g.stroke();
@@ -981,6 +1023,7 @@ function draw(){
     labels.push({y:py(v),text:text,color:color});
   };
   mark(D.price,'最新价 '+f2(D.price),ink,[4,3],true);
+  if(volPoc!=null) mark(volPoc,'成交最密集的价位 '+f2(volPoc)+' ('+pct(volPoc,ref)+')',muted,[3,3],true);
   if(ex){
     if(Math.abs(ex.F-D.price)/D.price>0.003) mark(ex.F,'参考价 '+f2(ex.F),css('--accent'),[],true);
     mark(ref+ex.move,'上沿 68%  '+f2(ref+ex.move)+' ('+pct(ref+ex.move,ref)+')',css('--accent'),[6,3],true);
@@ -1021,7 +1064,7 @@ $('cv').addEventListener('mousemove',function(e){
     const n=geo.bars.length, i=Math.min(n-1,Math.max(0,Math.floor((x-geo.L)/(geo.hw/n)))), b=geo.bars[i];
     hover={x:geo.L+geo.hw/n*(i+0.5), y:y};
     const v=geo.y1-(y-geo.T)/geo.PH*(geo.y1-geo.y0);
-    html=b[0]+'<br>开 '+f2(b[1])+'　高 '+f2(b[2])+'<br>低 '+f2(b[3])+'　收 '+f2(b[4])+'<br>光标价位 $'+f2(v)+'（'+pct(v,state.ref)+'）';
+    html=b[0]+'<br>开 '+f2(b[1])+'　高 '+f2(b[2])+'<br>低 '+f2(b[3])+'　收 '+f2(b[4])+(b[5]?'<br>成交量 '+fvol(b[5]):'')+'<br>光标价位 $'+f2(v)+'（'+pct(v,state.ref)+'）';
   } else if(state.lv){
     const v=geo.y1-(y-geo.T)/geo.PH*(geo.y1-geo.y0), ks=state.pf.ks, lv=state.lv;
     let bi=0; for(let i=1;i<ks.length;i++) if(Math.abs(ks[i]-v)<Math.abs(ks[bi]-v)) bi=i;
@@ -1051,8 +1094,8 @@ function syncStart(){
   const a=(D.bars||{})[tf]||[];
   if(!a.length){ $('k-note').textContent='这个周期没有读到 K 线数据。'; return; }
   const n=Math.min(viewN,a.length), first=a[0][0].slice(0,10), last=a[a.length-1][0].slice(0,10);
-  $('kstart').min=first; $('kstart').max=last; $('kstart').value=a[a.length-n][0].slice(0,10);
-  $('k-note').textContent=TFN[tf]+' K 线已读取 '+first+' 到 '+last+' 的数据，起始日期可以在这个范围内任意选择。';
+  const d1=(D.bars['1d']||[]); $('kstart').min=d1.length?d1[0][0].slice(0,10):first; $('kstart').max=last; $('kstart').value=a[a.length-n][0].slice(0,10);
+  $('k-note').textContent=TFN[tf]+' K 线已读取 '+first+' 到 '+last+' 的数据，起始日期可以在这个范围内任意选择。周期越短，能看的历史越短；选的时间超出范围时会自动换成更长的周期。';
 }
 function setStart(dateStr,nodraw){
   const a=(D.bars||{})[tf]||[];
@@ -1067,8 +1110,18 @@ document.querySelectorAll('[data-tf]').forEach(b=>b.addEventListener('click',fun
   document.querySelectorAll('[data-tf]').forEach(x=>x.setAttribute('aria-pressed',x===this));
   setStart(cur);
 }));
-document.querySelectorAll('[data-q]').forEach(b=>b.addEventListener('click',function(){ if(D) setStart(daysAgo(+this.dataset.q)); }));
-$('kstart').addEventListener('change',function(){ if(D && this.value) setStart(this.value); });
+function useTf(k){ tf=k; document.querySelectorAll('[data-tf]').forEach(x=>x.setAttribute('aria-pressed',x.dataset.tf===k)); }
+// 当前周期的历史不够长时，换成能覆盖所选起始日期的最短周期
+function fitTf(dateStr){
+  const order=['15m','30m','1h','2h','1d'], bars=D.bars||{};
+  const covers=k=>(bars[k]||[]).length && bars[k][0][0].slice(0,10)<=dateStr;
+  if(covers(tf)) return;
+  for(let i=order.indexOf(tf)+1;i<order.length;i++){ if(covers(order[i])){ useTf(order[i]); return; } }
+  if((bars['1d']||[]).length) useTf('1d');
+}
+document.querySelectorAll('[data-q]').forEach(b=>b.addEventListener('click',function(){ if(!D) return; const d=daysAgo(+this.dataset.q); fitTf(d); setStart(d); }));
+$('tg-vp').addEventListener('click',function(){ showVP=!showVP; this.setAttribute('aria-pressed',showVP); draw(); });
+$('kstart').addEventListener('change',function(){ if(D && this.value){ fitTf(this.value); setStart(this.value); } });
 document.querySelectorAll('[data-d]').forEach(b=>b.addEventListener('click',function(){
   if(!expiries.length) return;
   const d=+this.dataset.d; let last=0;

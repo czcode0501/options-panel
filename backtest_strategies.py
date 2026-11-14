@@ -127,6 +127,27 @@ def run(rows, n):
     return out
 
 
+def calibration(rows, n):
+    """概率校准：对“到期收盘高于某个价位”的概率，比较预测值和实际发生的比例。
+    价位取参考价上下若干倍预期波动，覆盖从很低到很高的各种概率。"""
+    out = []
+    for x in (-2, -1.5, -1, -0.5, 0, 0.5, 1, 1.5, 2):
+        pred, hit, k = 0.0, 0, 0
+        for t in range(len(rows) - n):
+            S, sig = rows[t][4], rows[t][5] * math.sqrt(n / 252)
+            level = S * (1 + x * sig)
+            if level <= 0:
+                continue
+            pred += 1 - ncdf((math.log(level / S) + sig * sig / 2) / sig)
+            hit += rows[t + n][4] > level
+            k += 1
+        indep = max(k // n, 1)
+        act = hit / k
+        out.append({"x": x, "pred": pred / k, "act": act, "n": k,
+                    "ci": 1.96 * math.sqrt(max(act * (1 - act), 1e-9) / indep)})
+    return out
+
+
 def money(x):
     return ("+" if x >= 0 else "-") + "$" + f"{abs(x):,.0f}"
 
@@ -153,6 +174,13 @@ def build_report(rows, source):
         for s in res[n]:
             ybody += f"<tr><td>{s['name']}</td>" + "".join(
                 f"<td>{'—' if s['years'][y] is None else format(s['years'][y] * 100, '.0f') + '%'}</td>" for y in years) + "</tr>"
+        cal = ""
+        for c in calibration(rows, n):
+            d = c["act"] - c["pred"]
+            ok = abs(d) <= max(c["ci"], 0.03)
+            where = "参考价" if c["x"] == 0 else f"参考价{'上方' if c['x'] > 0 else '下方'} {abs(c['x']):g} 倍预期波动"
+            cal += (f"<tr><td>{where}</td><td>{c['pred'] * 100:.0f}%</td><td class='{'' if ok else ('up' if d > 0 else 'down')}'>{c['act'] * 100:.0f}%</td>"
+                    f"<td>{d * 100:+.0f}（误差 ±{c['ci'] * 100:.0f}）</td><td class='l'>{'准' if ok else ('实际比预测更常发生' if d > 0 else '实际比预测更少发生')}</td></tr>")
         gap = sum(abs(s["act"] - s["pred"]) for s in res[n]) / len(res[n])
         summary.append(f"<li><b>{NAME[n]}</b>：{len(res[n])} 种策略里，预测胜率和实际胜率平均相差 <b>{gap * 100:.0f}</b> 个百分点；"
                        f"相差超过误差范围的有 <b>{sum(1 for s in res[n] if verdict(s)[1])}</b> 种。</li>")
@@ -160,6 +188,9 @@ def build_report(rows, source):
 <section class="panel"><h2>{NAME[n]}</h2>
 <div class="tablewrap"><table><thead><tr><th>策略</th><th>预测胜率</th><th>实际胜率</th><th>相差（百分点）</th><th>平均每笔盈亏</th><th>赚的时候平均赚</th><th>亏的时候平均亏</th><th>最差的一笔</th><th class="l">结论</th></tr></thead><tbody>{body}</tbody></table></div>
 <p class="sub">共 {res[n][0]['n']} 笔，每个交易日建一笔。金额是一组（每条腿一张）的美元数，已按现在的股价 ${rows[-1][4]:.2f} 折算，方便和模拟器里的数字对照。</p>
+<h2>概率本身准不准：高概率是不是真的高，低概率是不是真的低</h2>
+<div class="tablewrap"><table><thead><tr><th>到期时收盘高于这个价位</th><th>预测的概率</th><th>实际发生的比例</th><th>相差（百分点）</th><th class="l">结论</th></tr></thead><tbody>{cal}</tbody></table></div>
+<p class="sub">这张表检验的是模拟器算概率的方法本身。从上到下，预测的概率由高到低。如果预测 85% 的事实际发生了 85% 左右、预测 15% 的事实际发生了 15% 左右，说明高概率确实高、低概率确实低。所有策略的胜率都是由这些概率组合出来的。</p>
 <h2>各年的实际胜率</h2>
 <div class="tablewrap"><table><thead><tr><th>策略</th>{''.join(f'<th>{y}</th>' for y in years)}</tr></thead><tbody>{ybody}</tbody></table></div>
 </section>"""

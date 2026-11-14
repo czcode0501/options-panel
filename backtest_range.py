@@ -12,7 +12,8 @@
 
 结果会生成一个网页报告并自动打开。数据保存在 backtest_data 文件夹，同一天再运行不用重新读取。
 """
-import sys, os, csv, math, random, webbrowser, urllib.request
+import sys, os, csv, json, math, random, webbrowser, urllib.request
+from html import escape
 from pathlib import Path
 from datetime import date, datetime, timedelta
 
@@ -171,8 +172,9 @@ def verdict(hit, target, ci):
     return ("范围偏宽", "up") if diff > 0 else ("范围偏窄", "down")
 
 
-def svg_lines(series, dates, ref=None, ref_label="", height=300):
-    """series: [(名称, CSS 颜色变量, [数值或 None])]，各序列和 dates 等长。"""
+def svg_lines(series, dates, ref=None, ref_label="", height=300, ahead=None):
+    """series: [(名称, CSS 颜色变量, [数值或 None])]，各序列和 dates 等长。
+    ahead: {序列名: n}，表示这个序列在某一天的数值统计的是之后 n 个交易日。"""
     W, H, L, R, T, B = 1000, height, 52, 16, 14, 28
     vals = [v for _, _, s in series for v in s if v is not None] + ([ref] if ref is not None else [])
     if not vals:
@@ -189,7 +191,8 @@ def svg_lines(series, dates, ref=None, ref_label="", height=300):
         out.append(f'<line x1="{L}" y1="{py(v):.1f}" x2="{W - R}" y2="{py(v):.1f}" stroke="var(--line)"/>'
                    f'<text x="{L - 6}" y="{py(v) + 4:.1f}" text-anchor="end" font-size="11" fill="var(--muted)">{v * 100:.0f}%</text>')
     for i in range(0, n, max(1, n // 7)):
-        out.append(f'<text x="{px(i):.1f}" y="{H - 8}" text-anchor="middle" font-size="11" fill="var(--muted)">{dates[i][:7]}</text>')
+        anchor = "end" if px(i) > W - R - 30 else "middle"
+        out.append(f'<text x="{px(i):.1f}" y="{H - 8}" text-anchor="{anchor}" font-size="11" fill="var(--muted)">{dates[i][:7]}</text>')
     if ref is not None:
         out.append(f'<line x1="{L}" y1="{py(ref):.1f}" x2="{W - R}" y2="{py(ref):.1f}" stroke="var(--ink)" stroke-dasharray="5 4"/>'
                    f'<text x="{W - R - 4}" y="{py(ref) - 5:.1f}" text-anchor="end" font-size="11" fill="var(--ink)">{ref_label}</text>')
@@ -206,9 +209,38 @@ def svg_lines(series, dates, ref=None, ref_label="", height=300):
             pts.append(seg)
         for seg in pts:
             out.append(f'<polyline points="{" ".join(seg)}" fill="none" stroke="var({color})" stroke-width="1.6"/>')
+    out.append(f'<line class="cur" x1="0" x2="0" y1="{T}" y2="{H - B}" stroke="var(--muted)" style="display:none"/>')
     out.append("</svg>")
     legend = "".join(f'<span><i style="background:var({c})"></i>{nm}</span>' for nm, c, _ in series)
-    return "".join(out) + f'<div class="legend">{legend}</div>'
+    payload = {"W": W, "L": L, "R": R, "dates": dates,
+               "series": [{"name": nm, "ahead": (ahead or {}).get(nm, 0),
+                           "v": [None if v is None else round(v, 4) for v in sv]} for nm, c, sv in series]}
+    return ('<div class="chart" data-c="' + escape(json.dumps(payload, ensure_ascii=False), quote=True) + '">'
+            + "".join(out) + '<div class="tip"></div></div>'
+            + f'<div class="legend">{legend}<span>把鼠标移到图上可以看每一天的具体数值</span></div>')
+
+
+SCRIPT = """<script>
+document.querySelectorAll('.chart').forEach(function(el){
+  var c=JSON.parse(el.dataset.c), svg=el.querySelector('svg'), tip=el.querySelector('.tip'), cur=svg.querySelector('.cur'), n=c.dates.length;
+  svg.addEventListener('mousemove',function(e){
+    var r=svg.getBoundingClientRect(), x=(e.clientX-r.left)/r.width*c.W, span=c.W-c.L-c.R;
+    var i=Math.max(0,Math.min(n-1,Math.round((x-c.L)/span*(n-1)))), cx=c.L+i/Math.max(n-1,1)*span;
+    cur.setAttribute('x1',cx); cur.setAttribute('x2',cx); cur.style.display='';
+    var h='<b>'+c.dates[i]+'</b>';
+    c.series.forEach(function(s){
+      var v=s.v[i], name=s.name;
+      if(s.ahead && v!=null) name+='（'+c.dates[i]+' 之后到 '+c.dates[Math.min(i+s.ahead,n-1)]+'）';
+      h+='<br>'+name+'：<b>'+(v==null?(s.ahead?'还没走满 '+s.ahead+' 个交易日':'无数据'):(v*100).toFixed(1)+'%')+'</b>';
+    });
+    tip.innerHTML=h; tip.style.display='block';
+    var px=cx/c.W*r.width, w=tip.offsetWidth;
+    tip.style.left=Math.max(0,Math.min(px+14,r.width-w-4))+'px';
+    if(px+14+w>r.width) tip.style.left=Math.max(0,px-w-14)+'px';
+  });
+  svg.addEventListener('mouseleave',function(){ cur.style.display='none'; tip.style.display='none'; });
+});
+</script>"""
 
 
 def build_report(rows, source):
@@ -286,8 +318,11 @@ def build_report(rows, source):
         if i >= win - 1:
             roll[i] = run / win
     chart1 = svg_lines([(f"最近 {win} 个交易日的命中率", "--accent", roll)], [o["date"] for o in o5], 0.683, "理论值 68.3%")
-    chart2 = svg_lines([("隐含波动率（当天）", "--accent", [x[1] for x in ra]), ("之后 21 个交易日的实际波动率", "--warn", [x[2] for x in ra])],
-                       [x[0] for x in ra], height=320)
+    rv_name = "之后 21 个交易日的实际波动率"
+    chart2 = svg_lines([("隐含波动率（当天）", "--accent", [r[5] for r in rows]),
+                        (rv_name, "--warn", [x[2] for x in ra] + [None] * (len(rows) - len(ra)))],
+                       [r[0] for r in rows], height=320, ahead={rv_name: 21})
+    last_rv = ra[-1][0]
 
     h1 = main["hit1"]
     return f"""<!DOCTYPE html>
@@ -311,6 +346,9 @@ th,td{{padding:7px 10px;text-align:right;border-bottom:1px solid var(--line);whi
 td{{font-family:var(--num)}} th:first-child,td:first-child,.l{{text-align:left;font-family:var(--font)}}
 td.up{{color:var(--up);font-weight:600}} td.down{{color:var(--down);font-weight:600}}
 ul{{margin:0;padding-left:18px;display:flex;flex-direction:column;gap:5px;max-width:95ch}}
+.chart{{position:relative}} .chart svg{{cursor:crosshair}}
+.tip{{position:absolute;top:8px;pointer-events:none;display:none;background:var(--panel);border:1px solid var(--line);border-radius:6px;padding:8px 10px;font-size:12px;white-space:nowrap;box-shadow:0 2px 8px rgba(0,0,0,.15)}}
+.tip b{{font-family:var(--num)}}
 .legend{{display:flex;gap:16px;flex-wrap:wrap;font-size:12px;color:var(--muted)}} .legend i{{display:inline-block;width:14px;height:3px;vertical-align:middle;margin-right:5px}}
 </style></head><body><main>
 <div><h1>{SYMBOL} 波动范围回测</h1>
@@ -344,7 +382,8 @@ ul{{margin:0;padding-left:18px;display:flex;flex-direction:column;gap:5px;max-wi
 
 <section class="panel"><h2>命中率随时间的变化（{short[n5]}的 68% 范围）</h2>{chart1}</section>
 <section class="panel"><h2>隐含波动率和之后的实际波动率</h2>{chart2}
-<p class="sub">蓝线在橙线上方的时候，期权定价的波动大于之后实际发生的波动，卖方占优；橙线冲到蓝线上方的那几段，就是卖方亏大钱的时候。</p></section>
+<p class="sub">蓝线在橙线上方的时候，期权定价的波动大于之后实际发生的波动，卖方占优；橙线冲到蓝线上方的那几段，就是卖方亏大钱的时候。</p>
+<p class="sub">蓝线画到最新一天（{rows[-1][0]}）。橙线只能画到 {last_rv}：它在每一天的数值，统计的是那一天之后 21 个交易日的实际波动，{last_rv} 之后的日子还没有走满 21 个交易日，所以暂时没有数值。橙线最右端那个点已经包含了截至 {rows[-1][0]} 的行情。</p></section>
 
 <section class="panel"><h2>方法和局限</h2><ul class="sub">
 <li>做法：对过去每一个交易日，用当天收盘时的隐含波动率算出之后 N 个交易日的 1 倍范围（价格 × 隐含波动率 × √(N/252)），再看 N 个交易日后的收盘价落在哪里。只用了当天已知的数据，没有用到未来的信息。</li>
@@ -353,7 +392,7 @@ ul{{margin:0;padding-left:18px;display:flex;flex-direction:column;gap:5px;max-wi
 <li>价格没有做分红调整，对结果影响很小。</li>
 <li>这个回测只检验“范围有多宽”准不准，不涉及涨跌方向，也不检验 Call 墙、Put 墙这些持仓价位。过去的统计结果不保证以后成立。</li>
 </ul></section>
-</main></body></html>"""
+</main>{SCRIPT}</body></html>"""
 
 
 def main():

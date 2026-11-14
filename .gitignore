@@ -1,0 +1,16 @@
+# 从 IBKR 读取并保存在本机的行情数据，不上传
+options_data/
+*.json
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# 系统和编辑器文件
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+.spyproject/

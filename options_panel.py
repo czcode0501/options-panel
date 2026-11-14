@@ -609,6 +609,8 @@ ul{margin:0;padding-left:18px;display:flex;flex-direction:column;gap:4px;font-si
       <span><i style="background:var(--muted);opacity:.25"></i>价值区（70% 的持仓）</span>
       <span>在 K 线上滚动鼠标滚轮可以缩放；鼠标移到 K 线或横条上看明细</span>
     </div>
+    <div class="sub">左边的 K 线是过去的价格，用上方的 K 线周期和起始日期调整。右边的持仓分布是今天还没到期的期权，用页面上方“期权到期日的时间范围”的两个滑块调整，改 K 线的时间不会改变它。
+    </div>
   </section>
 
   <section class="panel">
@@ -965,7 +967,7 @@ function draw(){
     ks.forEach((k,i)=>{ let a=0,n=0; for(let j=Math.max(0,i-2);j<=Math.min(ks.length-1,i+2);j++){a+=lv.tot[j];n++;} const x=px0+sx(a/n); if(i) g.lineTo(x,py(k)); else g.moveTo(x,py(k)); });
     g.stroke(); g.globalAlpha=1;
     g.fillStyle=muted; g.textAlign='left'; g.textBaseline='top'; g.font='12px '+css('--font');
-    g.fillText('持仓分布（最长的横条 = '+f0(maxT)+' 张）',px0+4,T-19);
+    g.fillText('持仓分布：'+(s.sel.length>1?dstr(s.sel[0]).slice(5)+' 到 '+dstr(s.exp).slice(5):dstr(s.exp).slice(5))+' 到期的期权，最长的横条 = '+f0(maxT)+' 张',px0+4,T-19);
   } else {
     g.fillStyle=muted; g.textAlign='left'; g.font='13px '+css('--font'); g.fillText('所选范围内没有持仓数据',px0+8,T+20);
   }

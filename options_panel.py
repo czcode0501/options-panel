@@ -407,6 +407,8 @@ class Handler(BaseHTTPRequestHandler):
         symbol = re.sub(r"\s+", " ", q.get("symbol", "").upper().strip())
         if u.path == "/":
             return self.send(PAGE.encode("utf-8"), "text/html; charset=utf-8")
+        if u.path == "/sim":
+            return self.send(SIM_PAGE.encode("utf-8"), "text/html; charset=utf-8")
         if u.path == "/api/state":
             with lock:
                 return self.send(dict(state))
@@ -498,6 +500,7 @@ input[type=text]{width:130px;font-family:var(--num);text-transform:uppercase}
 .btn{border:1px solid var(--line);background:var(--panel);color:var(--ink);border-radius:6px;padding:8px 14px;font:inherit;cursor:pointer}
 .btn.primary{background:var(--accent);border-color:var(--accent);color:#fff}
 .btn.chip{padding:4px 10px;font-size:13px;font-family:var(--num)}
+a.btn{text-decoration:none;display:inline-block}
 .btn[aria-pressed=true]{background:var(--accent);border-color:var(--accent);color:#fff}
 button:focus-visible,input:focus-visible,select:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 #status{font-size:13px;color:var(--muted)}
@@ -542,6 +545,7 @@ ul{margin:0;padding-left:18px;display:flex;flex-direction:column;gap:4px;font-si
   <section class="panel">
     <div class="row">
       <h1 id="title">期权持仓看板</h1>
+      <a class="btn chip" href="/sim">打开期权模拟器</a>
       <span class="grow"></span>
       <label class="sub" for="sym">股票代码</label>
       <input id="sym" type="text" value="QQQ" maxlength="10" autocomplete="off" spellcheck="false">
@@ -1277,6 +1281,443 @@ chips(); load(false);
 </body>
 </html>
 """
+
+
+# 第二个页面：期权模拟器。样式和通用的计算函数取自看板页面，保证两边算法一致
+SIM_PAGE = r"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>期权模拟器</title>
+<style>
+__CSS__
+canvas#pc{height:440px;cursor:crosshair}
+.legs{display:flex;flex-direction:column;gap:6px;overflow-x:auto}
+.leg{display:grid;grid-template-columns:76px 76px 110px 64px 150px 1fr 34px;gap:6px;align-items:center;min-width:720px}
+.leg.head{font-size:12px;color:var(--muted)}
+.leg select,.leg input{padding:6px 6px;width:100%;font:inherit;color:var(--ink);background:var(--panel);border:1px solid var(--line);border-radius:6px}
+.leg .px{font-family:var(--num);font-size:13px}
+.x{border:1px solid var(--line);background:transparent;color:var(--muted);border-radius:6px;height:32px;cursor:pointer;font:inherit}
+tr.pick{cursor:pointer}
+tr.pick:hover td{background:var(--accent-soft)}
+tr.cur td{background:var(--accent-soft);font-weight:600}
+.warn{color:var(--down)}
+.say{font-size:15px;max-width:95ch}
+</style>
+</head>
+<body>
+<main>
+  <section class="panel">
+    <div class="row">
+      <h1 id="title">期权模拟器</h1>
+      <a class="btn chip" href="/">返回期权看板</a>
+      <span class="grow"></span>
+      <label class="sub" for="sym">股票代码</label>
+      <select id="sym"></select>
+      <label class="sub" for="exp">到期日</label>
+      <select id="exp"></select>
+      <span class="sub">成交价格按</span>
+      <button class="btn chip" type="button" id="pm-ba" aria-pressed="true">买卖报价</button>
+      <button class="btn chip" type="button" id="pm-mid" aria-pressed="false">中间价</button>
+    </div>
+    <div id="status" class="sub">正在读取…</div>
+  </section>
+
+  <div id="body" class="empty">
+  <section class="panel">
+    <h2>常见策略一览（点一行载入下面的组合）</h2>
+    <div class="tablewrap"><table><thead><tr><th>策略</th><th>开仓</th><th>最大盈利</th><th>最大亏损</th><th>盈利概率</th><th>盈亏平衡点</th><th>怎样才赚钱</th></tr></thead><tbody id="tpl"></tbody></table></div>
+    <p class="sub">每个策略的行权价按这个到期日的预期波动幅度自动选取：平值指最接近参考价的行权价，价外的腿放在大约一倍预期波动的位置。金额是一组（每条腿一张）的美元数。</p>
+  </section>
+
+  <section class="panel">
+    <h2>当前组合</h2>
+    <div class="legs" id="legs"></div>
+    <div class="row"><button class="btn" id="add" type="button">加一条腿</button><span class="sub" id="leg-note"></span></div>
+    <p class="say" id="say"></p>
+    <div class="tiles" id="t-main"></div>
+    <div class="tiles" id="t-more"></div>
+  </section>
+
+  <section class="panel">
+    <h2>到期时和现在的盈亏</h2>
+    <div class="chartwrap"><canvas id="pc"></canvas><div class="tipbox" id="ptip"></div></div>
+    <div class="legend">
+      <span><i style="background:var(--muted)"></i>到期时的盈亏（虚线）</span>
+      <span><i style="background:var(--accent)"></i>假设情形下的盈亏</span>
+      <span><i style="background:var(--up);opacity:.35"></i>赚钱的价位</span>
+      <span><i style="background:var(--down);opacity:.35"></i>亏钱的价位</span>
+      <span><i style="background:var(--accent);opacity:.2"></i>预期波动范围（约 68% 概率）</span>
+      <span>把鼠标移到图上看每个价位的盈亏和到达概率</span>
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2>开仓之后，假设发生了这些变化</h2>
+    <div class="slider"><label for="w-s">标的价格变到 <b id="w-s-o"></b></label><input id="w-s" type="range" min="0" max="1" step="0.01" value="0"></div>
+    <div class="slider"><label for="w-v">隐含波动率变化 <b id="w-v-o"></b></label><input id="w-v" type="range" min="-20" max="20" step="1" value="0"></div>
+    <div class="slider"><label for="w-t">时间过去了 <b id="w-t-o"></b></label><input id="w-t" type="range" min="0" max="1" step="any" value="0"></div>
+    <div class="tiles" id="t-what"></div>
+  </section>
+
+  <section class="panel">
+    <h2>这些数字是怎么算的，哪些不能全信</h2>
+    <ul>
+      <li>价格用的是看板读取到的真实报价。默认按买卖报价算：买入的腿按卖价成交，卖出的腿按买价成交，这更接近实际能成交的价格。选“中间价”会更乐观。没有买卖报价的合约改用最新成交价，并会标出来。</li>
+      <li>最大盈利、最大亏损、盈亏平衡点是按到期那天计算的，这三个数是确定的，不依赖任何假设。组合里有不同到期日的腿时，按最近的到期日计算，还没到期的腿按理论价估值。</li>
+      <li>盈利概率（胜率）是按期权市场自己的定价算出来的：以参考价为中心，波动大小取这个到期日的预期波动幅度，统计到期时价格落在赚钱区间的概率。它不是对未来的预测，也不包含方向判断。</li>
+      <li>胜率高不等于划算。卖方策略通常胜率高但赚得少、亏的时候亏得多；买方策略相反。“按市场定价的平均结果”把概率和金额合在一起看，它通常是一个小的负数，差额就是买卖价差的成本。</li>
+      <li>回测显示这套概率在平时是准的，但隐含波动率偏高的时候实际波动往往更大，胜率会比这里显示的低。</li>
+      <li>没有计入手续费、提前被行权和盘中触发止损的情况。休市时报价是收盘时的冻结数据，开盘后会变。这些都不是买卖建议。</li>
+    </ul>
+  </section>
+  </div>
+</main>
+
+<script>
+// 每行: [到期日, 行权价, C/P, 持仓量, 买价, 卖价, 最新价, IV, 成交量]
+__CALC__
+
+/*SIM-START*/
+function ncdf(x){
+  const t=1/(1+0.2316419*Math.abs(x)), d=0.3989422804014327*Math.exp(-x*x/2);
+  const p=d*t*(0.319381530+t*(-0.356563782+t*(1.781477937+t*(-1.821255978+t*1.330274429))));
+  return x>=0?1-p:p;
+}
+// 以远期价格 F 计价的期权理论价；T 以年为单位
+function black(F,K,T,v,call){
+  if(T<=1e-9 || v<=0) return Math.max(call?F-K:K-F,0);
+  const sq=Math.sqrt(T), d1=(Math.log(F/K)+v*v*T/2)/(v*sq), d2=d1-v*sq;
+  return call?F*ncdf(d1)-K*ncdf(d2):K*ncdf(-d2)-F*ncdf(-d1);
+}
+function impliedVol(price,F,K,T,call){
+  if(price==null || T<=1e-9 || price<=Math.max(call?F-K:K-F,0)+1e-6) return null;
+  let lo=0.01, hi=5;
+  if(black(F,K,T,hi,call)<price) return null;
+  for(let i=0;i<60;i++){ const m=(lo+hi)/2; if(black(F,K,T,m,call)<price) lo=m; else hi=m; }
+  return (lo+hi)/2;
+}
+function legPrice(r,side,useMid){
+  const b=r[4], a=r[5], l=r[6], m=(b!=null && a!=null && a>=b && a>0)?(a+b)/2:null;
+  if(useMid) return m!=null?m:l;
+  if(side>0) return (a!=null && a>0)?a:(m!=null?m:l);
+  return (b!=null && b>0)?b:(m!=null?m:l);
+}
+// legs: [{m: 方向×张数, call, K, price, iv, T(天)}]；F 参考价，sigT 到最近到期日的一倍波动（占参考价的比例），Tn 最近到期日的天数
+function analyze(legs,F,sigT,Tn){
+  const pnl=function(S){
+    let v=0;
+    for(const l of legs){
+      const rem=(l.T-Tn)/365;
+      v+=l.m*((rem<=1e-6?Math.max(l.call?S-l.K:l.K-S,0):black(S,l.K,rem,l.iv,l.call))-l.price);
+    }
+    return v*100;
+  };
+  const z=x=>(Math.log(x/F)+sigT*sigT/2)/sigT;
+  const N=3000, lo=F*Math.exp(-6*sigT), hi=F*Math.exp(6*sigT);
+  let pop=0, ev=0, mx=-Infinity, mn=Infinity, prevC=ncdf(z(lo));
+  const mids=[], mass=[];
+  for(let i=0;i<N;i++){
+    const b=lo*Math.pow(hi/lo,(i+1)/N), a=lo*Math.pow(hi/lo,i/N), c=ncdf(z(b)), w=c-prevC, p=pnl((a+b)/2);
+    prevC=c; mids.push(p); mass.push(w);
+    if(p>0) pop+=w; ev+=w*p; if(p>mx) mx=p; if(p<mn) mn=p;
+  }
+  const ks=[...new Set(legs.map(l=>l.K))].sort((a,b)=>a-b);
+  [0.01].concat(ks,[ks[ks.length-1]*3]).forEach(function(s){ const p=pnl(s); if(p>mx) mx=p; if(p<mn) mn=p; });
+  let netC=0; legs.forEach(l=>{ if(l.call) netC+=l.m; });
+  const upInf=netC>1e-9, dnInf=netC<-1e-9;
+  let half=null;
+  if(!dnInf && mn<0){ half=0; mids.forEach((p,i)=>{ if(p<=mn*0.5) half+=mass[i]; }); }
+  // 盈亏平衡点和赚钱的区间：从接近 0 扫到足够高
+  const top=Math.max(hi,ks[ks.length-1]*1.6), M=4000, be=[], zones=[];
+  let px=0.01, pp=pnl(px), start=pp>0?0:null;
+  for(let i=1;i<=M;i++){
+    const x=0.01+(top-0.01)*i/M, p=pnl(x);
+    if((pp<=0 && p>0) || (pp>0 && p<=0)){
+      const r=px+(x-px)*(0-pp)/(p-pp); be.push(r);
+      if(p>0) start=r; else { zones.push([start,r]); start=null; }
+    }
+    px=x; pp=p;
+  }
+  if(start!==null) zones.push([start,Infinity]);
+  const cost=legs.reduce((a,l)=>a+l.m*l.price,0)*100;
+  return {pnl:pnl, cost:cost, pop:pop, ev:ev, max:mx, min:mn, upInf:upInf, dnInf:dnInf, be:be, zones:zones, half:half};
+}
+/*SIM-END*/
+
+const $=id=>document.getElementById(id);
+const css=n=>getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+const f2=x=>x.toFixed(2);
+const usd=x=>'$'+Math.abs(Math.round(x)).toLocaleString('en-US');
+const sgn=x=>(x>=0?'+':'-')+usd(x);
+const dstr=e=>e.slice(0,4)+'-'+e.slice(4,6)+'-'+e.slice(6,8);
+const wk=e=>'日一二三四五六'[new Date(+e.slice(0,4),+e.slice(4,6)-1,+e.slice(6,8)).getDay()];
+const pctOf=(v,ref)=>((v/ref-1)*100>=0?'+':'')+((v/ref-1)*100).toFixed(1)+'%';
+function tile(k,v,d,cls,main){ return '<div class="tile'+(main?' main':'')+'"><span class="k">'+k+'</span><span class="v '+(cls||'')+'">'+v+'</span><span class="d">'+(d||'')+'</span></div>'; }
+
+let D=null, expiries=[], byExp={}, info={}, look={}, legs=[], useMid=false, curTpl=null, R=null, geo=null, hoverX=null;
+
+async function api(path){ const r=await fetch(path); return r.json(); }
+async function start(){
+  let list=[]; try{ list=await api('/api/symbols'); }catch(e){}
+  let want=''; try{ want=localStorage.getItem('opt_symbol')||''; }catch(e){}
+  if(!list.length){ $('status').textContent='还没有任何数据。请先回到期权看板查询一个股票代码。'; $('status').className='warn'; return; }
+  if(list.indexOf(want)<0) want=list[0];
+  $('sym').innerHTML=list.map(s=>'<option'+(s===want?' selected':'')+'>'+s+'</option>').join('');
+  loadSymbol(want);
+}
+async function loadSymbol(sym){
+  let r; try{ r=await api('/api/data?symbol='+encodeURIComponent(sym)); }catch(e){ r={error:'看板程序没有响应'}; }
+  if(r.error || !r.rows){ $('status').textContent=(r.error||'没有数据')+'。请先回到期权看板查询这个代码（今天的数据才可用）。'; $('status').className='warn'; $('body').classList.add('empty'); return; }
+  D=r; byExp={}; look={}; info={};
+  for(const x of D.rows){ (byExp[x[0]]=byExp[x[0]]||[]).push(x); look[x[0]+'|'+x[1]+'|'+x[2]]=x; }
+  expiries=Object.keys(byExp).sort().filter(function(e){
+    const ex=expected(byExp[e]); if(!ex) return false;
+    const T=daysTo(e,D.generated);
+    info[e]={F:ex.F, move:ex.move, T:T, atm:ex.iv!=null?ex.iv:ex.move/ex.F/Math.sqrt(T/365), kA:ex.kA};
+    return true;
+  });
+  if(!expiries.length){ $('status').textContent='这个代码没有可用的买卖报价，无法模拟。'; $('status').className='warn'; $('body').classList.add('empty'); return; }
+  let def=expiries.findIndex(e=>info[e].T>=5); if(def<0) def=expiries.length-1;
+  $('exp').innerHTML=expiries.map((e,i)=>'<option value="'+e+'"'+(i===def?' selected':'')+'>'+dstr(e)+'（周'+wk(e)+'，'+info[e].T.toFixed(1)+' 天后）</option>').join('');
+  document.title=D.symbol+' 期权模拟器'; $('title').textContent=D.symbol+' 期权模拟器';
+  $('body').classList.remove('empty'); $('status').className='sub';
+  try{ localStorage.setItem('opt_symbol',D.symbol); }catch(e){}
+  setExpiry();
+}
+function setExpiry(){
+  const e=$('exp').value, I=info[e];
+  $('status').textContent='数据读取于 '+D.generated.replace('T',' ')+' · 参考价 $'+f2(I.F)+' · 到 '+dstr(e)+' 的预期波动 ±$'+f2(I.move)+'（±'+(I.move/I.F*100).toFixed(1)+'%，约 68% 概率） · 没有实时订阅时为延迟或收盘冻结的报价';
+  curTpl='condor'; legs=template('condor',e)||template('call',e)||[];
+  renderTemplates(); drawLegs(); update(true);
+}
+
+/* ---------- 模板 ---------- */
+function strikesOf(e,type){ return byExp[e].filter(x=>x[2]===type && legPrice(x,1,true)!=null).map(x=>x[1]).sort((a,b)=>a-b); }
+function near(list,x){ let b=null; for(const k of list) if(b===null || Math.abs(k-x)<Math.abs(b-x)) b=k; return b; }
+function further(list,k,dir){ const i=list.indexOf(k)+dir; return i>=0 && i<list.length?list[i]:null; }
+const TPL=[['call','买入 Call'],['put','买入 Put'],['bullcall','牛市看涨价差（付钱买）'],['bearput','熊市看跌价差（付钱买）'],
+  ['bullput','卖出看跌价差（收钱，看不跌）'],['bearcall','卖出看涨价差（收钱，看不涨）'],['straddle','买入跨式'],['strangle','买入宽跨式'],
+  ['condor','铁鹰'],['ironfly','铁蝶'],['butterfly','蝶式'],['calendar','日历价差']];
+function template(id,e){
+  const I=info[e], C=strikesOf(e,'C'), P=strikesOf(e,'P'); if(!C.length || !P.length) return null;
+  const F=I.F, m=I.move, L=(side,type,K,qty,exp)=>({side:side,type:type,K:K,qty:qty||1,exp:exp||e});
+  const pick=function(list,x,avoid,dir){ let k=near(list,x); while(k!==null && avoid.indexOf(k)>=0) k=further(list,k,dir); return k; };
+  const ac=near(C,F), ap=near(P,F);
+  const c1=pick(C,F+m,[ac],1), c2=c1===null?null:pick(C,F+1.5*m,[ac,c1],1);
+  const p1=pick(P,F-m,[ap],-1), p2=p1===null?null:pick(P,F-1.5*m,[ap,p1],-1);
+  const cl=pick(C,F-m,[ac],-1);
+  const ok=(...a)=>a.every(x=>x!==null && x!==undefined);
+  switch(id){
+    case 'call': return [L(1,'C',ac)];
+    case 'put': return [L(1,'P',ap)];
+    case 'bullcall': return ok(c1)?[L(1,'C',ac),L(-1,'C',c1)]:null;
+    case 'bearput': return ok(p1)?[L(1,'P',ap),L(-1,'P',p1)]:null;
+    case 'bullput': return ok(p1,p2)?[L(-1,'P',p1),L(1,'P',p2)]:null;
+    case 'bearcall': return ok(c1,c2)?[L(-1,'C',c1),L(1,'C',c2)]:null;
+    case 'straddle': return [L(1,'C',ac),L(1,'P',near(P,ac))];
+    case 'strangle': return ok(c1,p1)?[L(1,'C',c1),L(1,'P',p1)]:null;
+    case 'condor': return ok(c1,c2,p1,p2)?[L(-1,'P',p1),L(1,'P',p2),L(-1,'C',c1),L(1,'C',c2)]:null;
+    case 'ironfly': return ok(c2,p2)?[L(-1,'C',ac),L(-1,'P',near(P,ac)),L(1,'C',c2),L(1,'P',p2)]:null;
+    case 'butterfly': return ok(cl,c1)?[L(1,'C',cl),L(-1,'C',ac,2),L(1,'C',c1)]:null;
+    case 'calendar': { const i=expiries.indexOf(e), e2=expiries[i+1]; if(!e2) return null; const k2=near(strikesOf(e2,'C'),ac); return k2===ac?[L(-1,'C',ac),L(1,'C',ac,1,e2)]:null; }
+  }
+  return null;
+}
+
+/* ---------- 计算 ---------- */
+function resolve(list){
+  if(!list || !list.length) return null;
+  const out=[]; let Tn=Infinity, en=null, noQuote=0;
+  for(const l of list){
+    const r=look[l.exp+'|'+l.K+'|'+l.type], I=info[l.exp]; if(!r || !I) return null;
+    const price=legPrice(r,l.side,useMid); if(price==null) return null;
+    if(!(r[4]!=null && r[5]!=null && r[5]>=r[4] && r[5]>0)) noQuote++;
+    const call=l.type==='C';
+    const iv=r[7]!=null?r[7]:(impliedVol(legPrice(r,1,true),I.F,l.K,I.T/365,call)||I.atm);
+    out.push({m:l.side*l.qty, call:call, K:l.K, price:price, iv:iv, T:I.T, bid:r[4], ask:r[5]});
+    if(I.T<Tn){ Tn=I.T; en=l.exp; }
+  }
+  const I=info[en];
+  return {legs:out, F:I.F, sigT:I.move/I.F, move:I.move, Tn:Tn, exp:en, noQuote:noQuote};
+}
+function zoneText(a){
+  if(!a.zones.length) return '到期时在任何价位都不赚钱';
+  if(a.zones.length===1 && a.zones[0][0]===0 && a.zones[0][1]===Infinity) return '到期时在任何价位都赚钱';
+  return '到期时价格'+a.zones.map(function(z){
+    if(z[0]===0) return '低于 $'+f2(z[1]);
+    if(z[1]===Infinity) return '高于 $'+f2(z[0]);
+    return '在 $'+f2(z[0])+' 到 $'+f2(z[1])+' 之间';
+  }).join('，或')+'才赚钱';
+}
+function renderTemplates(){
+  const e=$('exp').value; let h='';
+  TPL.forEach(function(t){
+    const r=resolve(template(t[0],e));
+    if(!r){ h+='<tr><td>'+t[1]+'</td><td colspan="6" style="text-align:left;font-family:var(--font);color:var(--muted)">这个到期日的行权价或报价不够，组不出来</td></tr>'; return; }
+    const a=analyze(r.legs,r.F,r.sigT,r.Tn);
+    h+='<tr class="pick'+(curTpl===t[0]?' cur':'')+'" data-t="'+t[0]+'"><td>'+t[1]+'</td><td>'+(a.cost>=0?'付出 ':'收入 ')+usd(a.cost)+'</td>'+
+      '<td class="up">'+(a.upInf?'无上限':sgn(a.max))+'</td><td class="down">'+(a.dnInf?'无上限':sgn(a.min))+'</td>'+
+      '<td>'+(a.pop*100).toFixed(0)+'%</td><td>'+(a.be.length?a.be.map(x=>'$'+f2(x)).join(' / '):'无')+'</td>'+
+      '<td style="text-align:left;font-family:var(--font)">'+zoneText(a).replace('到期时','')+'</td></tr>';
+  });
+  $('tpl').innerHTML=h;
+}
+function drawLegs(){
+  let h='<div class="leg head"><span>方向</span><span>类型</span><span>行权价</span><span>张数</span><span>到期日</span><span>成交价格</span><span></span></div>';
+  legs.forEach(function(l,i){
+    const ks=strikesOf(l.exp,l.type); if(ks.indexOf(l.K)<0) l.K=near(ks,l.K);
+    const r=look[l.exp+'|'+l.K+'|'+l.type], p=r?legPrice(r,l.side,useMid):null;
+    const q=r && r[4]!=null && r[5]!=null && r[5]>=r[4] && r[5]>0;
+    h+='<div class="leg">'+
+      '<select id="lg-'+i+'-side" aria-label="方向"><option value="1"'+(l.side>0?' selected':'')+'>买入</option><option value="-1"'+(l.side<0?' selected':'')+'>卖出</option></select>'+
+      '<select id="lg-'+i+'-type" aria-label="类型"><option value="C"'+(l.type==='C'?' selected':'')+'>Call</option><option value="P"'+(l.type==='P'?' selected':'')+'>Put</option></select>'+
+      '<select id="lg-'+i+'-K" aria-label="行权价">'+ks.map(k=>'<option'+(k===l.K?' selected':'')+'>'+k+'</option>').join('')+'</select>'+
+      '<input id="lg-'+i+'-qty" aria-label="张数" type="number" min="1" max="50" step="1" value="'+l.qty+'">'+
+      '<select id="lg-'+i+'-exp" aria-label="到期日">'+expiries.map(e=>'<option value="'+e+'"'+(e===l.exp?' selected':'')+'>'+dstr(e)+'</option>').join('')+'</select>'+
+      '<span class="px">'+(p==null?'<span class="warn">没有报价</span>':'$'+f2(p)+(q?'　买 '+f2(r[4])+' / 卖 '+f2(r[5]):'　<span class="warn">无买卖报价，用最新成交价</span>'))+'</span>'+
+      '<button class="x" id="lg-'+i+'-rm" type="button" aria-label="删除这条腿"'+(legs.length<2?' disabled':'')+'>×</button></div>';
+  });
+  $('legs').innerHTML=h; $('add').disabled=legs.length>=6;
+}
+function update(resetWhat){
+  R=resolve(legs);
+  if(!R){ $('say').textContent='这个组合里有合约没有报价，算不出来。换一个行权价或到期日试试。'; $('say').className='say warn'; $('t-main').innerHTML=''; $('t-more').innerHTML=''; $('t-what').innerHTML=''; geo=null; drawChart(); return; }
+  const a=analyze(R.legs,R.F,R.sigT,R.Tn); R.a=a;
+  $('say').className='say';
+  $('say').textContent=zoneText(a)+'。按期权市场的定价，这种情况发生的概率约 '+(a.pop*100).toFixed(0)+'%。'+
+    (a.dnInf?'注意：这个组合有裸卖的 Call，标的大涨时亏损没有上限。':'');
+  $('leg-note').textContent=R.noQuote?('有 '+R.noQuote+' 条腿没有买卖报价，用的是最新成交价，结果可能不准。'):'';
+  const rr=(!a.upInf && !a.dnInf && a.min<0)?a.max/Math.abs(a.min):null;
+  let h=tile(a.cost>=0?'开仓付出':'开仓收入',usd(a.cost),a.cost>=0?'买方组合：先付钱，最多亏掉这笔钱'+(a.dnInf?'':'')+'':'卖方组合：先收钱，这笔钱就是最多能赚的','',true);
+  h+=tile('盈利概率（胜率）',(a.pop*100).toFixed(0)+'%','到 '+dstr(R.exp)+' 收盘时赚钱的概率；亏钱的概率是 '+((1-a.pop)*100).toFixed(0)+'%','',true);
+  h+=tile('最大盈利',a.upInf?'无上限':sgn(a.max),a.upInf?'标的涨得越多赚得越多':(a.cost>0?'相当于成本的 '+(a.max/a.cost*100).toFixed(0)+'%':''),'up');
+  h+=tile('最大亏损',a.dnInf?'无上限':sgn(a.min),a.dnInf?'标的大涨时亏损没有上限':(a.half!=null?'亏掉一半以上最大亏损的概率约 '+(a.half*100).toFixed(0)+'%':''),'down');
+  $('t-main').innerHTML=h;
+  h=tile('盈亏平衡点',a.be.length?a.be.map(x=>'$'+f2(x)).join(' / '):'无',a.be.length?'距参考价 '+a.be.map(x=>pctOf(x,R.F)).join(' / ')+'；一倍预期波动是 ±'+(R.sigT*100).toFixed(1)+'%':'','sm');
+  if(rr!=null) h+=tile('最多赚的是最多亏的几倍',rr.toFixed(2)+' 倍',rr<0.5?'赚得少亏得多，靠高胜率弥补':(rr>2?'亏得少赚得多，但胜率通常低':'赚和亏的幅度接近'));
+  h+=tile('按市场定价的平均结果',sgn(a.ev),'把每种结果的金额乘以概率加总。通常是小的负数，差额主要是买卖价差',a.ev>=0?'up':'down');
+  const now=S=>R.legs.reduce((s,l)=>s+l.m*black(S,l.K,l.T/365,l.iv,l.call),0)*100;
+  const d=(now(R.F*1.005)-now(R.F*0.995))/(R.F*0.01);
+  const th=R.legs.reduce((s,l)=>s+l.m*(black(R.F,l.K,Math.max(l.T-1,0)/365,l.iv,l.call)-black(R.F,l.K,l.T/365,l.iv,l.call)),0)*100;
+  const ve=R.legs.reduce((s,l)=>s+l.m*(black(R.F,l.K,l.T/365,l.iv+0.01,l.call)-black(R.F,l.K,l.T/365,l.iv,l.call)),0)*100;
+  h+=tile('标的涨 $1 的盈亏（Delta）',sgn(d),Math.abs(d)<8?'几乎不赌方向':(d>0?'偏看涨':'偏看跌'));
+  h+=tile('过一天的盈亏（Theta）',sgn(th),th>1?'时间流逝对它有利':(th<-1?'时间流逝对它不利':'时间影响很小'));
+  h+=tile('隐含波动率升 1 点的盈亏（Vega）',sgn(ve),ve>1?'波动率上升对它有利':(ve<-1?'波动率下降对它有利':'波动率影响很小'));
+  $('t-more').innerHTML=h;
+  if(resetWhat){
+    const ks=R.legs.map(l=>l.K), lo=Math.min(R.F-3*R.move,Math.min(...ks)-0.5*R.move), hi=Math.max(R.F+3*R.move,Math.max(...ks)+0.5*R.move);
+    $('w-s').min=Math.max(lo,0.01).toFixed(2); $('w-s').max=hi.toFixed(2); $('w-s').step=((hi-lo)/400).toFixed(3); $('w-s').value=R.F.toFixed(2);
+    $('w-v').value=0; $('w-t').max=R.Tn; $('w-t').value=0;
+  }
+  what();
+}
+function whatPnl(S){
+  const dv=+$('w-v').value/100, el=+$('w-t').value;
+  return R.legs.reduce((s,l)=>s+l.m*(black(S,l.K,Math.max(l.T-el,0)/365,Math.max(l.iv+dv,0.01),l.call)-l.price),0)*100;
+}
+function what(){
+  if(!R) return;
+  const S=+$('w-s').value, dv=+$('w-v').value, el=+$('w-t').value, p=whatPnl(S);
+  $('w-s-o').textContent='$'+f2(S)+'（'+pctOf(S,R.F)+'）';
+  $('w-v-o').textContent=(dv>=0?'+':'')+dv+' 个百分点';
+  $('w-t-o').textContent=(el<1?(el*24).toFixed(1)+' 小时':el.toFixed(1)+' 天')+' / '+R.Tn.toFixed(1)+' 天';
+  $('t-what').innerHTML=tile('假设情形下的盈亏',sgn(p),'如果现在就按理论价平仓',p>=0?'up':'down',true)+
+    tile('和到期时相比',sgn(R.a.pnl(S)),'同样的价位，持有到 '+dstr(R.exp)+' 的盈亏',R.a.pnl(S)>=0?'up':'down');
+  drawChart();
+}
+
+/* ---------- 图 ---------- */
+function drawChart(){
+  const c=$('pc'), dpr=window.devicePixelRatio||1, W=c.clientWidth, H=c.clientHeight;
+  c.width=Math.round(W*dpr); c.height=Math.round(H*dpr);
+  const g=c.getContext('2d'); g.setTransform(dpr,0,0,dpr,0,0); g.clearRect(0,0,W,H);
+  const muted=css('--muted');
+  if(!R){ g.fillStyle=muted; g.font='13px '+css('--font'); g.fillText('没有可显示的组合',16,30); return; }
+  const x0=+$('w-s').min, x1=+$('w-s').max, N=260, ex=[], nw=[]; let y0=0, y1=0;
+  for(let i=0;i<=N;i++){ const x=x0+(x1-x0)*i/N, a=R.a.pnl(x), b=whatPnl(x); ex.push([x,a]); nw.push([x,b]); y0=Math.min(y0,a,b); y1=Math.max(y1,a,b); }
+  const sp=Math.max(y1-y0,1); y0-=sp*0.08; y1+=sp*0.08;
+  const L=64, Rm=16, T=26, B=30, px=x=>L+(x-x0)/(x1-x0)*(W-L-Rm), py=y=>T+(H-T-B)*(1-(y-y0)/(y1-y0));
+  geo={x0:x0,x1:x1,L:L,Rm:Rm,W:W,T:T,B:B,H:H};
+  // 预期波动范围
+  g.fillStyle=css('--accent'); g.globalAlpha=0.10;
+  const a=Math.max(px(R.F-R.move),L), b=Math.min(px(R.F+R.move),W-Rm); g.fillRect(a,T,b-a,H-T-B); g.globalAlpha=1;
+  // 网格
+  g.font='11px '+css('--num'); g.lineWidth=1;
+  const step=function(r,n){ const raw=r/n, p=Math.pow(10,Math.floor(Math.log10(raw))), m=raw/p; return (m<1.5?1:m<3.5?2:m<7.5?5:10)*p; };
+  const ys=step(y1-y0,6); g.textAlign='right'; g.textBaseline='middle';
+  for(let y=Math.ceil(y0/ys)*ys;y<=y1;y+=ys){ g.strokeStyle=css('--line'); g.beginPath(); g.moveTo(L,py(y)); g.lineTo(W-Rm,py(y)); g.stroke(); g.fillStyle=muted; g.fillText((y<0?'-':'')+'$'+Math.abs(Math.round(y)).toLocaleString('en-US'),L-6,py(y)); }
+  const xs=step(x1-x0,8); g.textAlign='center'; g.textBaseline='top';
+  for(let x=Math.ceil(x0/xs)*xs;x<=x1;x+=xs) g.fillText(xs<1?x.toFixed(1):x.toFixed(0),px(x),H-B+8);
+  // 赚钱和亏钱的区域
+  const area=function(pos){
+    g.beginPath(); g.moveTo(px(ex[0][0]),py(0));
+    ex.forEach(p=>g.lineTo(px(p[0]),py(pos?Math.max(p[1],0):Math.min(p[1],0))));
+    g.lineTo(px(ex[N][0]),py(0)); g.closePath(); g.fillStyle=css(pos?'--up':'--down'); g.globalAlpha=0.16; g.fill(); g.globalAlpha=1;
+  };
+  area(true); area(false);
+  g.strokeStyle=css('--ink'); g.lineWidth=1; g.beginPath(); g.moveTo(L,py(0)); g.lineTo(W-Rm,py(0)); g.stroke();
+  // 参考价和行权价
+  g.setLineDash([4,3]); g.strokeStyle=css('--accent'); g.beginPath(); g.moveTo(px(R.F),T); g.lineTo(px(R.F),H-B); g.stroke();
+  g.setLineDash([2,3]); g.strokeStyle=muted;
+  [...new Set(R.legs.map(l=>l.K))].forEach(function(k){ if(k<x0||k>x1) return; g.beginPath(); g.moveTo(px(k),T); g.lineTo(px(k),H-B); g.stroke(); });
+  g.setLineDash([]);
+  g.font='11px '+css('--font'); g.textBaseline='bottom'; g.textAlign='center'; g.fillStyle=css('--accent');
+  g.fillText('参考价 '+f2(R.F),px(R.F),T-4);
+  g.fillStyle=muted; g.textAlign='left'; g.fillText('浅蓝色区域：约 68% 概率落在这里',L+4,T-4);
+  const path=function(pts,col,dash,w){ g.beginPath(); g.setLineDash(dash); g.strokeStyle=col; g.lineWidth=w; pts.forEach((p,i)=>{ if(i) g.lineTo(px(p[0]),py(p[1])); else g.moveTo(px(p[0]),py(p[1])); }); g.stroke(); g.setLineDash([]); };
+  path(ex,muted,[6,4],1.8); path(nw,css('--accent'),[],2);
+  R.a.be.forEach(function(x){ if(x<x0||x>x1) return; g.beginPath(); g.fillStyle=css('--ink'); g.arc(px(x),py(0),3.5,0,Math.PI*2); g.fill(); });
+  const S=+$('w-s').value; g.beginPath(); g.fillStyle=css('--accent'); g.arc(px(S),py(whatPnl(S)),5,0,Math.PI*2); g.fill(); g.lineWidth=2; g.strokeStyle=css('--panel'); g.stroke();
+  if(hoverX!=null){ g.strokeStyle=muted; g.lineWidth=1; g.beginPath(); g.moveTo(px(hoverX),T); g.lineTo(px(hoverX),H-B); g.stroke(); }
+}
+$('pc').addEventListener('mousemove',function(e){
+  if(!geo || !R) return;
+  const r=this.getBoundingClientRect(), xpix=e.clientX-r.left, g=geo;
+  const x=g.x0+(xpix-g.L)/(g.W-g.L-g.Rm)*(g.x1-g.x0);
+  if(x<g.x0 || x>g.x1){ hoverX=null; $('ptip').style.display='none'; drawChart(); return; }
+  hoverX=x; drawChart();
+  const pa=1-ncdf((Math.log(x/R.F)+R.sigT*R.sigT/2)/R.sigT), tip=$('ptip');
+  tip.innerHTML='<b>$'+f2(x)+'</b>（'+pctOf(x,R.F)+'）<br>到期时盈亏：<b>'+sgn(R.a.pnl(x))+'</b><br>假设情形下盈亏：<b>'+sgn(whatPnl(x))+'</b><br>到期收盘高于这里的概率：<b>'+(pa*100).toFixed(0)+'%</b><br>到期收盘低于这里的概率：<b>'+((1-pa)*100).toFixed(0)+'%</b>';
+  tip.style.display='block';
+  tip.style.left=(xpix+14+tip.offsetWidth>r.width?Math.max(0,xpix-tip.offsetWidth-14):xpix+14)+'px';
+});
+$('pc').addEventListener('mouseleave',function(){ hoverX=null; $('ptip').style.display='none'; drawChart(); });
+
+/* ---------- 交互 ---------- */
+$('legs').addEventListener('change',function(e){
+  const m=/^lg-(\d+)-(\w+)$/.exec(e.target.id); if(!m) return;
+  const l=legs[+m[1]], v=e.target.value;
+  if(m[2]==='side') l.side=+v; else if(m[2]==='type') l.type=v; else if(m[2]==='K') l.K=+v;
+  else if(m[2]==='qty') l.qty=Math.max(1,Math.round(+v)||1); else if(m[2]==='exp') l.exp=v;
+  curTpl=null; renderTemplates(); drawLegs(); update(true);
+});
+$('legs').addEventListener('click',function(e){
+  const m=/^lg-(\d+)-rm$/.exec(e.target.id); if(!m || legs.length<2) return;
+  legs.splice(+m[1],1); curTpl=null; renderTemplates(); drawLegs(); update(true);
+});
+$('add').addEventListener('click',function(){ const l=legs[legs.length-1]; legs.push({side:1,type:l.type,K:l.K,qty:1,exp:l.exp}); curTpl=null; renderTemplates(); drawLegs(); update(true); });
+$('tpl').addEventListener('click',function(e){
+  const tr=e.target.closest('tr.pick'); if(!tr) return;
+  const t=template(tr.dataset.t,$('exp').value); if(!t) return;
+  curTpl=tr.dataset.t; legs=t; renderTemplates(); drawLegs(); update(true);
+});
+function setMode(mid){ useMid=mid; $('pm-ba').setAttribute('aria-pressed',!mid); $('pm-mid').setAttribute('aria-pressed',mid); if(D){ renderTemplates(); drawLegs(); update(false); } }
+$('pm-ba').addEventListener('click',()=>setMode(false));
+$('pm-mid').addEventListener('click',()=>setMode(true));
+$('exp').addEventListener('change',setExpiry);
+$('sym').addEventListener('change',function(){ loadSymbol(this.value); });
+['w-s','w-v','w-t'].forEach(id=>$(id).addEventListener('input',what));
+window.addEventListener('resize',drawChart);
+if(window.matchMedia) window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change',drawChart);
+start();
+</script>
+</body>
+</html>
+"""
+SIM_PAGE = (SIM_PAGE.replace("__CSS__", PAGE.split("<style>")[1].split("</style>")[0])
+            .replace("__CALC__", PAGE.split("/*CALC-START*/")[1].split("/*CALC-END*/")[0]))
 
 
 def main():

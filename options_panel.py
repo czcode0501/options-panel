@@ -9,7 +9,7 @@
 
 程序窗口要一直开着，关掉窗口看板就停了。数据按“代码 + 日期”保存在 options_data 文件夹里。
 """
-import sys, os, re, json, math, time, queue, random, threading, asyncio, webbrowser
+import sys, os, re, csv, json, math, time, queue, random, threading, asyncio, webbrowser, urllib.request
 from datetime import date, datetime, timedelta
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
@@ -21,7 +21,9 @@ MARKET_DATA_TYPE = 4     # 4 = 没有实时订阅时用延迟/收盘冻结数据
 BATCH = 90               # 账户同时只能订阅约 100 张合约，所以分批读取
 # K 线周期：(看板里的名字, IBKR 的周期, 读取多长的历史)
 BAR_SETS = [("15m", "15 mins", "30 D"), ("30m", "30 mins", "60 D"), ("1h", "1 hour", "120 D"),
-            ("2h", "2 hours", "1 Y"), ("1d", "1 day", "2 Y")]
+            ("2h", "2 hours", "1 Y"), ("1d", "1 day", "5 Y")]
+# 可以在看板里选来对比的波动率指数
+INDEXES = ("VIX", "VXN", "RVX", "VXD", "VIX9D", "VIX3M")
 DEMO = "--demo" in sys.argv   # 演示模式：不连接 IBKR，用模拟数据
 
 BASE = os.path.dirname(os.path.abspath(__file__))
@@ -32,6 +34,7 @@ lock = threading.Lock()
 jobs = queue.Queue()
 state = {"symbol": None, "status": "idle", "msg": "", "done": 0, "total": 0, "error": ""}
 cache = {}   # 代码 -> 当天的数据
+index_cache = {}   # 指数名 -> (日期, 数据)
 
 
 def set_state(**kw):
@@ -68,13 +71,88 @@ def get_cached(symbol, days=0):
                 cache[symbol] = d
         except (OSError, ValueError):
             d = None
-    if d is not None and d.get("v") != 2:
+    if d is not None and d.get("v") != 3:
         return None
     if d is not None and d.get("generated", "")[:10] != date.today().isoformat():
         return None
     if d is not None and d.get("max_days", 0) < days:
         return None
     return d
+
+
+def index_path(name):
+    return os.path.join(DATA_DIR, f"index_{name}_{date.today():%Y%m%d}.json")
+
+
+def cached_index(name):
+    with lock:
+        d = index_cache.get(name)
+    if d and d[0] == date.today():
+        return d[1]
+    if os.path.exists(index_path(name)):
+        try:
+            with open(index_path(name), encoding="utf-8") as f:
+                rows = json.load(f)
+            with lock:
+                index_cache[name] = (date.today(), rows)
+            return rows
+        except (OSError, ValueError):
+            pass
+    return None
+
+
+def save_index(name, rows):
+    with lock:
+        index_cache[name] = (date.today(), rows)
+    with open(index_path(name), "w", encoding="utf-8") as f:
+        json.dump(rows, f)
+
+
+def fetch_index_cboe(name):
+    """从 Cboe 官网下载波动率指数的每日历史。返回 [[日期, 数值(小数)], ...]。"""
+    url = f"https://cdn.cboe.com/api/global/us_indices/daily_prices/{name}_History.csv"
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=20) as r:
+        text = r.read().decode("utf-8", "replace")
+    rows = []
+    for row in csv.DictReader(text.splitlines()):
+        row = {k.strip().upper(): v for k, v in row.items() if k}
+        try:
+            d = row["DATE"].strip()
+            if "/" in d:
+                m, dd, y = d.split("/")
+                d = f"{y}-{int(m):02d}-{int(dd):02d}"
+            rows.append([d, float(row["CLOSE"]) / 100])
+        except (KeyError, ValueError):
+            continue
+    if len(rows) < 100:
+        raise RuntimeError("unexpected file format")
+    return rows[-1400:]
+
+
+def fetch_index_ib(ib, name):
+    """备用：从 IBKR 读取波动率指数的每日历史（可能需要指数行情订阅）。"""
+    from ib_async import Index
+    c = Index(name, "CBOE", "USD")
+    ib.qualifyContracts(c)
+    if not c.conId:
+        raise RuntimeError("index not found")
+    bars = ib.reqHistoricalData(c, endDateTime="", durationStr="5 Y", barSizeSetting="1 day",
+                                whatToShow="TRADES", useRTH=True)
+    if len(bars) < 100:
+        raise RuntimeError("no data")
+    return [[str(b.date)[:10], b.close / 100] for b in bars]
+
+
+def demo_index(name):
+    rnd, rows, d, i = random.Random(name), [], date.today() - timedelta(days=1900), 0
+    base = {"VIX": 0.18, "VXN": 0.23, "RVX": 0.24, "VXD": 0.16, "VIX9D": 0.17, "VIX3M": 0.20}[name]
+    while d <= date.today():
+        if d.weekday() < 5:
+            rows.append([d.isoformat(), round(base + 0.05 * math.sin(i / 45) + rnd.gauss(0, 0.008), 4)])
+            i += 1
+        d += timedelta(days=1)
+    return rows
 
 
 def hist_vol(closes):
@@ -110,6 +188,18 @@ def fetch(ib, symbol, days):
             got = []
         bars[key] = [bar(b) for b in got]
     daily = bars["1d"]
+    set_state(msg="正在读取隐含波动率历史")
+    try:
+        ivb = ib.reqHistoricalData(stk, endDateTime="", durationStr="5 Y", barSizeSetting="1 day",
+                                   whatToShow="OPTION_IMPLIED_VOLATILITY", useRTH=True)
+    except ConnectionError:
+        raise
+    except Exception:
+        ivb = []
+    ivmap = {str(b.date)[:10]: b.close for b in ivb if b.close and b.close > 0}
+    if ivmap and sorted(ivmap.values())[len(ivmap) // 2] > 3:     # 数值是百分数时换成小数
+        ivmap = {k: v / 100 for k, v in ivmap.items()}
+    vol_hist = [[b[0][:10], b[4], ivmap.get(b[0][:10])] for b in daily]
     price = clean(t.marketPrice()) or clean(t.close) or (daily[-1][4] if daily else None)
     if not price:
         raise RuntimeError("读不到 " + symbol + " 的价格，可能是行情暂时不可用，请稍后重试")
@@ -165,9 +255,9 @@ def fetch(ib, symbol, days):
                          clean(tk.bid), clean(tk.ask), clean(tk.last), iv, clean(tk.volume)])
             ib.cancelMktData(c)
 
-    return {"v": 2, "symbol": symbol, "price": price,
+    return {"v": 3, "symbol": symbol, "price": price,
             "generated": datetime.now().isoformat(timespec="minutes"),
-            "max_days": days, "bars": bars, "rows": rows}
+            "max_days": days, "bars": bars, "vol": vol_hist, "rows": rows}
 
 
 # ---------------------------------------------------------------- 演示数据（不连接 IBKR）
@@ -218,10 +308,12 @@ def demo_fetch(symbol, days):
     f = "%Y-%m-%d %H:%M"
     bars = {"15m": series(780, 0.002, f, timedelta(minutes=15)), "30m": series(780, 0.003, f, timedelta(minutes=30)),
             "1h": series(840, 0.004, f, timedelta(hours=1)), "2h": series(900, 0.006, f, timedelta(hours=2)),
-            "1d": series(500, 0.012, "%Y-%m-%d", timedelta(days=1))}
-    return {"v": 2, "symbol": symbol, "price": round(S * 0.995, 2),
+            "1d": series(1260, 0.012, "%Y-%m-%d", timedelta(days=1))}
+    vol_hist = [[b[0], b[4], round(vol + 0.06 * math.sin(i / 45) + rnd.gauss(0, 0.006), 4)]
+                for i, b in enumerate(bars["1d"])]
+    return {"v": 3, "symbol": symbol, "price": round(S * 0.995, 2),
             "generated": datetime.now().isoformat(timespec="minutes"), "max_days": days,
-            "bars": bars, "rows": rows}
+            "bars": bars, "vol": vol_hist, "rows": rows}
 
 
 # ---------------------------------------------------------------- 后台线程：负责和 IBKR 通信
@@ -234,7 +326,7 @@ def worker():
         ib = IB()
     while True:
         try:
-            symbol, days = jobs.get(timeout=0.2)
+            job = jobs.get(timeout=0.2)
         except queue.Empty:
             if ib is not None and ib.isConnected():
                 try:
@@ -242,6 +334,19 @@ def worker():
                 except Exception:
                     pass
             continue
+        if job[0] == "index":          # 从 IBKR 读取一个波动率指数的历史
+            _, name, holder = job
+            try:
+                if not ib.isConnected():
+                    ib.connect("127.0.0.1", IB_PORT, clientId=CLIENT_ID, readonly=True, timeout=10)
+                    ib.reqMarketDataType(MARKET_DATA_TYPE)
+                holder["rows"] = fetch_index_ib(ib, name)
+                save_index(name, holder["rows"])
+            except Exception as e:
+                holder["error"] = str(e) or type(e).__name__
+            holder["ev"].set()
+            continue
+        _, symbol, days = job
         try:
             if DEMO:
                 data = demo_fetch(symbol, days)
@@ -299,7 +404,7 @@ class Handler(BaseHTTPRequestHandler):
             with lock:
                 return self.send(dict(state))
         if u.path == "/api/symbols":
-            files = sorted((f for f in os.listdir(DATA_DIR) if f.endswith(".json")),
+            files = sorted((f for f in os.listdir(DATA_DIR) if f.endswith(".json") and not f.startswith("index_")),
                            key=lambda f: os.path.getmtime(os.path.join(DATA_DIR, f)), reverse=True)
             seen = []
             for f in files:
@@ -307,6 +412,32 @@ class Handler(BaseHTTPRequestHandler):
                 if s not in seen:
                     seen.append(s)
             return self.send(seen[:12])
+        if u.path == "/api/index":
+            name = q.get("name", "").upper()
+            if name not in INDEXES:
+                return self.send({"error": "不支持这个指数"})
+            rows = cached_index(name)
+            if rows is None:
+                try:
+                    rows = demo_index(name) if DEMO else fetch_index_cboe(name)
+                except Exception:
+                    rows = None
+                if rows is None:            # Cboe 下载失败时改从 IBKR 读取
+                    with lock:
+                        busy = state["status"] == "loading"
+                    if busy:
+                        return self.send({"retry": True})
+                    holder = {"ev": threading.Event()}
+                    jobs.put(("index", name, holder))
+                    if not holder["ev"].wait(60):
+                        return self.send({"retry": True})
+                    rows = holder.get("rows")
+                    if not rows:
+                        return self.send({"error": "读不到 " + name + " 的历史数据：Cboe 网站下载失败，IBKR 也没有返回"
+                                                   "（IBKR 的指数数据可能需要行情订阅）。"})
+                else:
+                    save_index(name, rows)
+            return self.send({"name": name, "rows": rows})
         if u.path == "/api/data":
             d = get_cached(symbol)
             return self.send(d if d else {"error": "还没有 " + symbol + " 的数据"})
@@ -323,7 +454,7 @@ class Handler(BaseHTTPRequestHandler):
                 if state["status"] == "loading":
                     return self.send({"status": "busy", "symbol": state["symbol"]})
                 state.update(symbol=symbol, status="loading", msg="准备读取", done=0, total=0, error="")
-            jobs.put((symbol, days))
+            jobs.put(("chain", symbol, days))
             return self.send({"status": "loading"})
         self.send({"error": "not found"}, code=404)
 
@@ -337,13 +468,13 @@ PAGE = r"""<!DOCTYPE html>
 <style>
 :root{
   --bg:#eef0f3; --panel:#ffffff; --ink:#16202e; --muted:#5d6878; --line:#d5dae2;
-  --accent:#1f5fbf; --accent-soft:#e3ecfa; --up:#0d7a4f; --down:#c0392b; --pain:#7a3fb0; --poc:#c98a00;
+  --accent:#1f5fbf; --accent-soft:#e3ecfa; --up:#0d7a4f; --down:#c0392b; --pain:#7a3fb0; --poc:#c98a00; --warn:#c9730a;
   --font:"Segoe UI","Microsoft YaHei","PingFang SC",sans-serif;
   --num:Consolas,"SFMono-Regular",monospace;
 }
 @media (prefers-color-scheme: dark){
   :root{ --bg:#10151d; --panel:#19212c; --ink:#e6ebf2; --muted:#93a0b3; --line:#2c3746;
-    --accent:#6fa4f5; --accent-soft:#1e2c44; --up:#3fc48d; --down:#f0776a; --pain:#b98be6; --poc:#e6b23c; color-scheme:dark; }
+    --accent:#6fa4f5; --accent-soft:#1e2c44; --up:#3fc48d; --down:#f0776a; --pain:#b98be6; --poc:#e6b23c; --warn:#f0a94a; color-scheme:dark; }
 }
 *{box-sizing:border-box}
 html,body{margin:0}
@@ -380,6 +511,10 @@ input[type=range]{width:100%;accent-color:var(--accent)}
 .up{color:var(--up)} .down{color:var(--down)}
 .chartwrap{position:relative}
 canvas{width:100%;height:660px;display:block}
+canvas.volcv{height:340px;cursor:crosshair}
+.tipbox{position:absolute;top:8px;pointer-events:none;background:var(--panel);border:1px solid var(--line);border-radius:6px;padding:8px 10px;font-size:12px;display:none;box-shadow:0 2px 8px rgba(0,0,0,.15);white-space:nowrap}
+.tipbox b{font-family:var(--num)}
+p.sub{margin:0;max-width:100ch}
 #tip{position:absolute;pointer-events:none;background:var(--panel);border:1px solid var(--line);border-radius:6px;padding:8px 10px;font-size:12px;display:none;box-shadow:0 2px 8px rgba(0,0,0,.15);white-space:nowrap;font-family:var(--num)}
 .legend{display:flex;gap:16px;flex-wrap:wrap;font-size:12px;color:var(--muted)}
 .legend i{display:inline-block;width:12px;height:12px;border-radius:2px;vertical-align:-1px;margin-right:5px}
@@ -481,6 +616,41 @@ ul{margin:0;padding-left:18px;display:flex;flex-direction:column;gap:4px;font-si
   </section>
 
   <section class="panel">
+    <div class="row">
+      <h2>隐含波动率和实际波动率</h2>
+      <span class="grow"></span>
+      <span class="sub">显示范围</span>
+      <button class="btn chip" type="button" data-vr="126">近 6 个月</button>
+      <button class="btn chip" type="button" data-vr="252" aria-pressed="true">近 1 年</button>
+      <button class="btn chip" type="button" data-vr="504">近 2 年</button>
+      <button class="btn chip" type="button" data-vr="99999">全部</button>
+    </div>
+    <div class="row">
+      <span class="sub">显示哪些线</span>
+      <button class="btn chip" type="button" id="tg-trail" aria-pressed="true">过去 21 个交易日的实际波动率</button>
+      <button class="btn chip" type="button" id="tg-ahead" aria-pressed="true">之后 21 个交易日的实际波动率</button>
+    </div>
+    <div class="tiles" id="t-vol"></div>
+    <div class="chartwrap"><canvas id="vc1" class="volcv"></canvas><div class="tipbox" id="vt1"></div></div>
+    <div class="legend" id="vl1"></div>
+    <p class="sub">蓝线是市场每天对未来一个月波动的预期。紫线是到当天为止最近 21 个交易日实际走出来的波动，每天当时就能算出来，可以直接和蓝线比较：紫线高于蓝线，说明最近的实际波动超过了市场的预期。橙线是每一天之后 21 个交易日的实际波动，是事后才知道的答案，所以最近 21 个交易日没有数值，只能用来回头检验当时的预期准不准。</p>
+  </section>
+
+  <section class="panel">
+    <div class="row">
+      <h2>和波动率指数对比</h2>
+      <span class="grow"></span>
+      <span class="sub">显示范围和上一张图相同</span>
+    </div>
+    <div class="row" id="idx-chips"></div>
+    <div class="sub" id="idx-note"></div>
+    <div class="tiles" id="t-idx"></div>
+    <div class="chartwrap"><canvas id="vc2" class="volcv"></canvas><div class="tipbox" id="vt2"></div></div>
+    <div class="legend" id="vl2"></div>
+    <p class="sub">蓝线是所查代码自己的 30 天隐含波动率（IBKR 的算法）。VXN 对应纳指 100，VIX 对应标普 500，RVX 对应罗素 2000，VXD 对应道指；VIX9D 和 VIX3M 是标普 500 的 9 天期和 3 个月期。这些指数由 Cboe 计算，把下跌保护的溢价也算了进去，所以即使标的相同（比如 QQQ 和 VXN），指数的数值通常也比蓝线高，两者适合比较走势和差距的变化，不适合直接比较绝对数字。查个股时，蓝线比 VIX 高出多少，反映的是这只股票相对大盘的额外风险。</p>
+  </section>
+
+  <section class="panel">
     <h2>这些数字是怎么算的</h2>
     <ul>
       <li>参考价：用结束日那个到期日的平值 Call 和 Put 的价差反推出的标的价格。它和期权报价是同一时刻的，休市时比盘后的最新成交价更适合做基准。</li>
@@ -488,6 +658,7 @@ ul{margin:0;padding-left:18px;display:flex;flex-direction:column;gap:4px;font-si
       <li>偏斜后的范围：用相邻行权价的期权价差反推出市场给各个价位的概率，再取第 16 和第 84 百分位，能反映下跌和上涨不对称的情况。</li>
       <li>持仓分布只统计 95% 范围附近的行权价，离现价太远的持仓多是对冲或博极端行情的仓位，不计入。</li>
       <li>POC：合计持仓最多的行权价。价值区：从 POC 向两边扩展，直到包含 70% 的持仓。Call 墙和 Put 墙：95% 范围内，参考价上方 Call 持仓最多、下方 Put 持仓最多的行权价。最大痛点：让期权买方合计亏损最多的到期价格。</li>
+      <li>实际波动率：每天收盘价涨跌幅（对数收益率）的标准差，乘以 √252 换算成年化。隐含波动率在过去一年的位置：过去 252 个交易日里，有多少天的隐含波动率低于今天。</li>
       <li>这些都只说明价位和幅度，不说明方向。持仓量每天只更新一次；没有实时行情订阅时，报价是延迟的，休市时是收盘时的冻结数据。</li>
     </ul>
   </section>
@@ -648,7 +819,7 @@ function init(){
   $('e1').value=def;
   setStart(daysAgo(30),true);
   try{ localStorage.setItem('opt_symbol',D.symbol); }catch(e){}
-  chips(); render();
+  chips(); render(); renderVol(); loadIndexes();
 }
 
 /* ---------- 计算和显示 ---------- */
@@ -900,8 +1071,140 @@ $('reload').addEventListener('click',()=>load(true));
 $('days').addEventListener('change',()=>load(false));
 $('sym').addEventListener('keydown',e=>{ if(e.key==='Enter') load(false); });
 $('chips').addEventListener('click',e=>{ const s=e.target.dataset && e.target.dataset.s; if(s){ $('sym').value=s; load(false); } });
-window.addEventListener('resize',draw);
-if(window.matchMedia) window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change',draw);
+window.addEventListener('resize',function(){ draw(); drawLines('vc1'); drawLines('vc2'); });
+if(window.matchMedia) window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change',function(){ draw(); drawLines('vc1'); drawLines('vc2'); });
+
+/* ---------- 波动率图 ---------- */
+const IDX={VIX:['VIX（标普 500）','--pain'],VXN:['VXN（纳指 100）','--warn'],RVX:['RVX（罗素 2000）','--up'],
+           VXD:['VXD（道指）','--down'],VIX9D:['VIX9D（标普 9 天期）','--poc'],VIX3M:['VIX3M（标普 3 个月期）','--muted']};
+let volN=252, showTrail=true, showAhead=true, idxOn=['VIX','VXN'], idxData={}, charts={};
+try{ const s=JSON.parse(localStorage.getItem('opt_idx')||'null'); if(Array.isArray(s)) idxOn=s.filter(k=>IDX[k]); }catch(e){}
+
+function rvSeries(close,n){
+  const lr=[null]; for(let i=1;i<close.length;i++) lr.push(Math.log(close[i]/close[i-1]));
+  const sd=function(a,b){ let m=0; for(let i=a;i<=b;i++) m+=lr[i]; m/=(b-a+1); let q=0; for(let i=a;i<=b;i++) q+=(lr[i]-m)*(lr[i]-m); return Math.sqrt(q/(b-a))*Math.sqrt(252); };
+  return {ahead:close.map((_,t)=>t+n<close.length?sd(t+1,t+n):null), trail:close.map((_,t)=>t-n>=0?sd(t-n+1,t):null)};
+}
+function lastVal(a){ for(let i=a.length-1;i>=0;i--) if(a[i]!=null) return [a[i],i]; return [null,-1]; }
+function drawLines(id){
+  const ch=charts[id], c=$(id); if(!c) return;
+  const dpr=window.devicePixelRatio||1, W=c.clientWidth, H=c.clientHeight;
+  c.width=Math.round(W*dpr); c.height=Math.round(H*dpr);
+  const g=c.getContext('2d'); g.setTransform(dpr,0,0,dpr,0,0); g.clearRect(0,0,W,H);
+  const muted=css('--muted');
+  if(!ch){ g.fillStyle=muted; g.font='13px '+css('--font'); g.fillText('没有可显示的数据',16,30); return; }
+  const N=ch.dates.length, a=Math.max(0,N-ch.n), n=N-a;
+  let lo=Infinity, hi=-Infinity;
+  ch.series.forEach(s=>{ for(let i=a;i<N;i++){ const v=s.v[i]; if(v!=null){ lo=Math.min(lo,v); hi=Math.max(hi,v); } } });
+  if(!isFinite(lo)){ g.fillStyle=muted; g.font='13px '+css('--font'); g.fillText('这个范围内没有数据',16,30); ch.geo=null; return; }
+  const pad=(hi-lo)*0.08||0.01; lo=Math.max(0,lo-pad); hi+=pad;
+  const L=50, R=14, T=12, B=26;
+  const px=i=>L+i/Math.max(n-1,1)*(W-L-R), py=v=>T+(H-T-B)*(1-(v-lo)/(hi-lo));
+  ch.geo={L:L,R:R,W:W,n:n,a:a};
+  g.font='11px '+css('--num'); g.lineWidth=1; g.textAlign='right'; g.textBaseline='middle';
+  for(let k=0;k<=4;k++){ const v=lo+(hi-lo)*k/4;
+    g.strokeStyle=css('--line'); g.beginPath(); g.moveTo(L,py(v)); g.lineTo(W-R,py(v)); g.stroke();
+    g.fillStyle=muted; g.fillText((v*100).toFixed(0)+'%',L-6,py(v)); }
+  g.textBaseline='top';
+  const step=Math.max(1,Math.floor(n/6));
+  for(let i=0;i<n;i+=step){ g.textAlign=px(i)>W-R-30?'right':'center'; g.fillText(n>140?ch.dates[a+i].slice(0,7):ch.dates[a+i].slice(5,10),px(i),H-B+8); }
+  ch.series.forEach(s=>{
+    g.strokeStyle=css(s.color); g.lineWidth=s.color==='--accent'?2:1.5; g.beginPath(); let pen=false;
+    for(let i=0;i<n;i++){ const v=s.v[a+i]; if(v==null){ pen=false; continue; } if(pen) g.lineTo(px(i),py(v)); else { g.moveTo(px(i),py(v)); pen=true; } }
+    g.stroke();
+  });
+  if(ch.hover!=null){ g.strokeStyle=muted; g.lineWidth=1; g.beginPath(); g.moveTo(px(ch.hover),T); g.lineTo(px(ch.hover),H-B); g.stroke(); }
+}
+function bindHover(id,tipId){
+  const c=$(id), tip=$(tipId);
+  c.addEventListener('mousemove',function(e){
+    const ch=charts[id]; if(!ch || !ch.geo) return;
+    const r=c.getBoundingClientRect(), g=ch.geo, span=g.W-g.L-g.R;
+    const i=Math.max(0,Math.min(g.n-1,Math.round((e.clientX-r.left-g.L)/span*(g.n-1)))), k=g.a+i;
+    ch.hover=i; drawLines(id);
+    let h='<b>'+ch.dates[k]+'</b>';
+    ch.series.forEach(function(s){
+      const v=s.v[k]; let nm=s.name;
+      if(s.ahead && v!=null) nm+='（到 '+ch.dates[Math.min(k+s.ahead,ch.dates.length-1)]+'）';
+      h+='<br>'+nm+'：<b>'+(v==null?(s.ahead?'还没走满 '+s.ahead+' 个交易日':'无数据'):(v*100).toFixed(1)+'%')+'</b>';
+    });
+    tip.innerHTML=h; tip.style.display='block';
+    const x=g.L+i/Math.max(g.n-1,1)*span, w=tip.offsetWidth;
+    tip.style.left=(x+14+w>r.width?Math.max(0,x-w-14):x+14)+'px';
+  });
+  c.addEventListener('mouseleave',function(){ const ch=charts[id]; if(ch){ ch.hover=null; drawLines(id); } tip.style.display='none'; });
+}
+function legendOf(series){ return series.map(s=>'<span><i style="background:var('+s.color+')"></i>'+s.name+'</span>').join('')+'<span>把鼠标移到图上看每一天的具体数值</span>'; }
+function renderVol(){
+  const v=(D && D.vol)||[], has=v.filter(r=>r[2]!=null).length;
+  if(v.length<30 || has<30){
+    charts.vc1=null; charts.vc2=null; drawLines('vc1'); drawLines('vc2');
+    $('t-vol').innerHTML=tile('隐含波动率历史','无数据','IBKR 没有返回这个代码的隐含波动率历史');
+    $('vl1').innerHTML=''; $('vl2').innerHTML=''; $('t-idx').innerHTML=''; return;
+  }
+  const dates=v.map(r=>r[0]), close=v.map(r=>r[1]), iv=v.map(r=>r[2]), rv=rvSeries(close,21);
+  const s1=[{name:'隐含波动率（当天）',color:'--accent',v:iv}];
+  if(showTrail) s1.push({name:'过去 21 个交易日的实际波动率',color:'--pain',v:rv.trail});
+  if(showAhead) s1.push({name:'之后 21 个交易日的实际波动率',color:'--warn',v:rv.ahead,ahead:21});
+  charts.vc1={dates:dates,series:s1,n:volN,hover:null}; drawLines('vc1'); $('vl1').innerHTML=legendOf(s1);
+
+  const li=lastVal(iv), lt=lastVal(rv.trail), la=lastVal(rv.ahead);
+  const yr=iv.slice(-252).filter(x=>x!=null), rank=yr.length?yr.filter(x=>x<li[0]).length/yr.length:null;
+  let h=tile('现在的隐含波动率',(li[0]*100).toFixed(1)+'%','数据日期 '+dates[li[1]]+'，市场对未来一个月波动的预期','',true);
+  if(lt[0]!=null){
+    const d=(lt[0]-li[0])*100;
+    h+=tile('过去 21 个交易日的实际波动率',(lt[0]*100).toFixed(1)+'%','截至 '+dates[lt[1]]);
+    h+=tile('实际减去预期',(d>=0?'+':'')+d.toFixed(1)+' 个百分点',d>2?'最近的实际波动高于市场预期，看板的范围容易偏窄':(d<-2?'最近的实际波动低于市场预期，看板的范围偏宽':'最近的实际波动和市场预期接近'),d>2?'down':(d<-2?'up':''));
+  }
+  if(rank!=null) h+=tile('隐含波动率在过去一年的位置','高于 '+(rank*100).toFixed(0)+'% 的日子',rank>0.8?'处在一年里偏高的位置，期权偏贵':(rank<0.2?'处在一年里偏低的位置，期权偏便宜':'处在一年里的中间位置'));
+  if(la[0]!=null) h+=tile('最近一个已知的“之后 21 日”数值',(la[0]*100).toFixed(1)+'%',dates[la[1]]+' 之后到 '+dates[Math.min(la[1]+21,dates.length-1)]+' 的实际波动，当时的隐含波动率是 '+(iv[la[1]]!=null?(iv[la[1]]*100).toFixed(1)+'%':'无数据'));
+  $('t-vol').innerHTML=h;
+
+  const s2=[{name:D.symbol+' 的隐含波动率',color:'--accent',v:iv}];
+  let t='';
+  idxOn.forEach(function(k){
+    const m=idxData[k]; if(!m) return;
+    let prev=null, miss=0;   // 指数个别日期缺数据时，沿用前一天的数值，最多 3 天
+    const sv=dates.map(function(d){ if(m[d]!=null){ prev=m[d]; miss=0; return prev; } miss++; return miss<=3?prev:null; });
+    s2.push({name:IDX[k][0],color:IDX[k][1],v:sv});
+    const l=lastVal(sv);
+    if(l[0]!=null && iv[l[1]]!=null){ const d=(l[0]-iv[l[1]])*100;
+      t+=tile(IDX[k][0],(l[0]*100).toFixed(1)+'%',dates[l[1]]+'，比 '+D.symbol+' 的隐含波动率'+(d>=0?'高 ':'低 ')+Math.abs(d).toFixed(1)+' 个百分点'); }
+  });
+  charts.vc2={dates:dates,series:s2,n:volN,hover:null}; drawLines('vc2'); $('vl2').innerHTML=legendOf(s2); $('t-idx').innerHTML=t;
+}
+function idxChips(){
+  $('idx-chips').innerHTML='<span class="sub">对比对象（可多选）</span>'+Object.keys(IDX).map(k=>'<button class="btn chip" type="button" data-i="'+k+'" aria-pressed="'+(idxOn.indexOf(k)>=0)+'">'+IDX[k][0]+'</button>').join('');
+}
+async function loadIndexes(){
+  idxChips();
+  let waiting=false; const errs=[];
+  for(const k of idxOn){
+    if(idxData[k]) continue;
+    let r; try{ r=await api('/api/index?name='+k); }catch(e){ r={error:'看板程序没有响应'}; }
+    if(r.rows){ const m={}; r.rows.forEach(x=>{ m[x[0]]=x[1]; }); idxData[k]=m; }
+    else if(r.retry) waiting=true;
+    else errs.push(r.error||('读不到 '+k));
+  }
+  $('idx-note').textContent=errs.join(' ')+(waiting?' 看板正在读取期权数据，指数稍后自动重试。':'');
+  $('idx-note').className='sub'+(errs.length?' down':'');
+  if(D) renderVol();
+  if(waiting) setTimeout(loadIndexes,5000);
+}
+$('idx-chips').addEventListener('click',function(e){
+  const k=e.target.dataset && e.target.dataset.i; if(!k) return;
+  const i=idxOn.indexOf(k); if(i>=0) idxOn.splice(i,1); else idxOn.push(k);
+  try{ localStorage.setItem('opt_idx',JSON.stringify(idxOn)); }catch(err){}
+  loadIndexes();
+});
+document.querySelectorAll('[data-vr]').forEach(b=>b.addEventListener('click',function(){
+  volN=+this.dataset.vr;
+  document.querySelectorAll('[data-vr]').forEach(x=>x.setAttribute('aria-pressed',x===this));
+  if(charts.vc1) charts.vc1.n=volN; if(charts.vc2) charts.vc2.n=volN; drawLines('vc1'); drawLines('vc2');
+}));
+$('tg-trail').addEventListener('click',function(){ showTrail=!showTrail; this.setAttribute('aria-pressed',showTrail); if(D) renderVol(); });
+$('tg-ahead').addEventListener('click',function(){ showAhead=!showAhead; this.setAttribute('aria-pressed',showAhead); if(D) renderVol(); });
+bindHover('vc1','vt1'); bindHover('vc2','vt2'); idxChips();
 
 try{ const s=localStorage.getItem('opt_symbol'); if(s) $('sym').value=s; }catch(e){}
 chips(); load(false);

@@ -91,6 +91,18 @@ python backtest_strategies.py --demo     # 不连接 IBKR，用模拟数据看�
 
 期权价格是按当天的隐含波动率用公式算出来的理论价，不是当时的真实成交价，也没有计入买卖价差和手续费，所以它检验的是胜率的算法，不能当作真实交易的收益。
 
+## 持仓价位回测
+
+`backtest_walls.py` 用来检验 Call 墙、Put 墙和最大痛点有没有用：对每一个到期日，回到它之前第 5 个交易日的开盘前，只用当时已经公布的持仓量算出这些价位，再看之后的真实走势，并和“同样距离的普通价位”作比较。
+
+```
+python backtest_walls.py --demo                # 用模拟数据看流程和报告（结论没有意义）
+python backtest_walls.py QQQ --oi 文件.csv      # 用历史持仓量文件回测
+python backtest_walls.py QQQ                   # 用看板每天保存的数据回测（需要先积累一段时间）
+```
+
+IBKR 不提供历史持仓量，需要另外准备数据。持仓量文件要有数据日期、到期日、C/P、行权价、持仓量这几列；学校数据库里的 OptionMetrics（WRDS）导出的期权价格文件可以直接使用。
+
 ## 设置
 
 在 `options_panel.py` 开头可以修改：

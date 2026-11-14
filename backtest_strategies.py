@@ -52,6 +52,9 @@ STRATEGIES = [
     ("铁鹰", [(-1, False, -1), (1, False, -1.5), (-1, True, 1), (1, True, 1.5)]),
     ("铁蝶", [(-1, True, 0), (-1, False, 0), (1, True, 1.5), (1, False, -1.5)]),
     ("蝶式", [(1, True, -1), (-2, True, 0), (1, True, 1)]),
+    # 第二项写 None 表示这条腿是 100 股股票
+    ("备兑看涨（持股 + 卖出 Call）", [(1, None, 0), (-1, True, 1)]),
+    ("保护性看跌（持股 + 买入 Put）", [(1, None, 0), (1, False, -1)]),
 ]
 
 
@@ -60,6 +63,9 @@ def build(S, iv, n, spec):
     T, m = n / 252, S * iv * math.sqrt(n / 252)
     legs, cost = [], 0.0
     for q, call, x in spec:
+        if call is None:                 # 股票：按当天收盘价买入，盈亏就是之后的涨跌
+            legs.append((q, None, S))
+            continue
         K = S + x * m
         p = black(S, K, T, iv, call)
         legs.append((q, call, K))
@@ -68,12 +74,12 @@ def build(S, iv, n, spec):
 
 
 def payoff(legs, cost, s):
-    return sum(q * (max(s - K, 0) if call else max(K - s, 0)) for q, call, K in legs) - cost
+    return sum(q * ((s - K) if call is None else max(s - K, 0) if call else max(K - s, 0)) for q, call, K in legs) - cost
 
 
 def predicted_pop(legs, cost, S, sig):
     """和模拟器相同的算法：以参考价为中心的对数正态分布，统计到期时赚钱的概率。"""
-    ks = sorted({K for _, _, K in legs})
+    ks = sorted({K for _, call, K in legs if call is not None})
     pts = [1e-9] + ks + [ks[-1] * 4]          # 盈亏在这些点之间是直线
     vals = [payoff(legs, cost, x) for x in pts]
     cdf = lambda x: ncdf((math.log(x / S) + sig * sig / 2) / sig)

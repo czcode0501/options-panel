@@ -1341,6 +1341,15 @@ tr.cur td{background:var(--accent-soft);font-weight:600}
   </section>
 
   <section class="panel">
+    <h2>历史回测：这个组合的胜率准不准</h2>
+    <p class="sub">把和当前组合结构相同的交易放到过去每一个交易日上：每条腿离参考价的距离按“几倍预期波动”保持不变，持有同样长的时间到期。预测只用当天已知的价格和隐含波动率，之后的真实价格只用来对答案。</p>
+    <div class="row"><button class="btn primary" id="bt-run" type="button">用历史数据回测当前组合</button><span class="sub" id="bt-note"></span></div>
+    <div class="tiles" id="bt-out"></div>
+    <div class="tablewrap"><table><thead id="bt-head"></thead><tbody id="bt-years"></tbody></table></div>
+    <p class="sub">回测里的期权价格是按当天的隐含波动率用公式算的理论价，所有行权价用同一个隐含波动率，没有计入买卖价差和手续费，行权价取理想位置，并假设每笔都持有到期。它检验的是胜率算法准不准，实际交易的平均盈亏会比这里差一些。</p>
+  </section>
+
+  <section class="panel">
     <h2>到期时和现在的盈亏</h2>
     <div class="chartwrap"><canvas id="pc"></canvas><div class="tipbox" id="ptip"></div></div>
     <div class="legend">
@@ -1409,6 +1418,7 @@ function analyze(legs,F,sigT,Tn){
   const pnl=function(S){
     let v=0;
     for(const l of legs){
+      if(l.stock){ v+=l.m*(S-l.price); continue; }
       const rem=(l.T-Tn)/365;
       v+=l.m*((rem<=1e-6?Math.max(l.call?S-l.K:l.K-S,0):black(S,l.K,rem,l.iv,l.call))-l.price);
     }
@@ -1423,9 +1433,10 @@ function analyze(legs,F,sigT,Tn){
     prevC=c; mids.push(p); mass.push(w);
     if(p>0) pop+=w; ev+=w*p; if(p>mx) mx=p; if(p<mn) mn=p;
   }
-  const ks=[...new Set(legs.map(l=>l.K))].sort((a,b)=>a-b);
+  const ks=[...new Set(legs.filter(l=>!l.stock).map(l=>l.K))].sort((a,b)=>a-b);
+  if(!ks.length) ks.push(F);
   [0.01].concat(ks,[ks[ks.length-1]*3]).forEach(function(s){ const p=pnl(s); if(p>mx) mx=p; if(p<mn) mn=p; });
-  let netC=0; legs.forEach(l=>{ if(l.call) netC+=l.m; });
+  let netC=0; legs.forEach(l=>{ if(l.call || l.stock) netC+=l.m; });   // 股票和 Call 在大涨时都随价格上涨
   const upInf=netC>1e-9, dnInf=netC<-1e-9;
   let half=null;
   if(!dnInf && mn<0){ half=0; mids.forEach((p,i)=>{ if(p<=mn*0.5) half+=mass[i]; }); }
@@ -1443,6 +1454,26 @@ function analyze(legs,F,sigT,Tn){
   if(start!==null) zones.push([start,Infinity]);
   const cost=legs.reduce((a,l)=>a+l.m*l.price,0)*100;
   return {pnl:pnl, cost:cost, pop:pop, ev:ev, max:mx, min:mn, upInf:upInf, dnInf:dnInf, be:be, zones:zones, half:half};
+}
+// 历史检验：把同样结构的组合放到过去每一个交易日上。
+// spec: [{m, stock, call, x}]，x 是行权价离参考价多少倍预期波动；N 持有的交易日数；vol: [[日期, 收盘价, 隐含波动率]]
+function histTest(spec,N,vol){
+  const rows=vol.filter(r=>r[1]>0 && r[2]>0), out={n:0,wins:0,pred:0,sum:0,sumW:0,sumL:0,worst:Infinity,best:-Infinity,years:{},indep:0,indepWins:0};
+  for(let t=0;t+N<rows.length;t++){
+    const S=rows[t][1], iv=rows[t][2], sig=iv*Math.sqrt(N/252), m=S*sig;
+    const legs=spec.map(function(s){
+      if(s.stock) return {m:s.m,stock:true,price:S,iv:0,T:N};
+      const K=Math.max(S+s.x*m,S*0.02);
+      return {m:s.m,call:s.call,K:K,price:black(S,K,N/252,iv,s.call),iv:iv,T:N};
+    });
+    const a=analyze(legs,S,sig,N), p=a.pnl(rows[t+N][1])/S, win=p>0, y=rows[t][0].slice(0,4);
+    out.n++; out.pred+=a.pop; out.sum+=p; if(win){ out.wins++; out.sumW+=p; } else out.sumL+=p;
+    if(p<out.worst) out.worst=p; if(p>out.best) out.best=p;
+    const yy=out.years[y]=out.years[y]||{n:0,wins:0,sum:0}; yy.n++; yy.sum+=p; if(win) yy.wins++;
+    if(t%N===0){ out.indep++; if(win) out.indepWins++; }
+  }
+  if(out.n){ out.first=rows[0][0]; out.last=rows[out.n-1][0]; }
+  return out;
 }
 /*SIM-END*/
 
@@ -1499,7 +1530,8 @@ function near(list,x){ let b=null; for(const k of list) if(b===null || Math.abs(
 function further(list,k,dir){ const i=list.indexOf(k)+dir; return i>=0 && i<list.length?list[i]:null; }
 const TPL=[['call','买入 Call'],['put','买入 Put'],['bullcall','牛市看涨价差（付钱买）'],['bearput','熊市看跌价差（付钱买）'],
   ['bullput','卖出看跌价差（收钱，看不跌）'],['bearcall','卖出看涨价差（收钱，看不涨）'],['straddle','买入跨式'],['strangle','买入宽跨式'],
-  ['condor','铁鹰'],['ironfly','铁蝶'],['butterfly','蝶式'],['calendar','日历价差']];
+  ['condor','铁鹰'],['ironfly','铁蝶'],['butterfly','蝶式'],['calendar','日历价差'],
+  ['covered','备兑看涨（持有 100 股 + 卖出 Call）'],['protective','保护性看跌（持有 100 股 + 买入 Put）']];
 function template(id,e){
   const I=info[e], C=strikesOf(e,'C'), P=strikesOf(e,'P'); if(!C.length || !P.length) return null;
   const F=I.F, m=I.move, L=(side,type,K,qty,exp)=>({side:side,type:type,K:K,qty:qty||1,exp:exp||e});
@@ -1521,6 +1553,8 @@ function template(id,e){
     case 'condor': return ok(c1,c2,p1,p2)?[L(-1,'P',p1),L(1,'P',p2),L(-1,'C',c1),L(1,'C',c2)]:null;
     case 'ironfly': return ok(c2,p2)?[L(-1,'C',ac),L(-1,'P',near(P,ac)),L(1,'C',c2),L(1,'P',p2)]:null;
     case 'butterfly': return ok(cl,c1)?[L(1,'C',cl),L(-1,'C',ac,2),L(1,'C',c1)]:null;
+    case 'covered': return ok(c1)?[L(1,'S',null),L(-1,'C',c1)]:null;
+    case 'protective': return ok(p1)?[L(1,'S',null),L(1,'P',p1)]:null;
     case 'calendar': { const i=expiries.indexOf(e), e2=expiries[i+1]; if(!e2) return null; const k2=near(strikesOf(e2,'C'),ac); return k2===ac?[L(-1,'C',ac),L(1,'C',ac,1,e2)]:null; }
   }
   return null;
@@ -1531,6 +1565,7 @@ function resolve(list){
   if(!list || !list.length) return null;
   const out=[]; let Tn=Infinity, en=null, noQuote=0;
   for(const l of list){
+    if(l.type==='S'){ const J=info[l.exp]; if(!J) return null; out.push({m:l.side*l.qty,stock:true,K:null,price:J.F,iv:0,T:J.T}); continue; }
     const r=look[l.exp+'|'+l.K+'|'+l.type], I=info[l.exp]; if(!r || !I) return null;
     const price=legPrice(r,l.side,useMid); if(price==null) return null;
     if(!(r[4]!=null && r[5]!=null && r[5]>=r[4] && r[5]>0)) noQuote++;
@@ -1539,6 +1574,8 @@ function resolve(list){
     out.push({m:l.side*l.qty, call:call, K:l.K, price:price, iv:iv, T:I.T, bid:r[4], ask:r[5]});
     if(I.T<Tn){ Tn=I.T; en=l.exp; }
   }
+  if(en===null){ en=list[0].exp; Tn=info[en].T; }
+  out.forEach(l=>{ if(l.stock) l.T=Tn; });
   const I=info[en];
   return {legs:out, F:I.F, sigT:I.move/I.F, move:I.move, Tn:Tn, exp:en, noQuote:noQuote};
 }
@@ -1567,7 +1604,17 @@ function renderTemplates(){
 function drawLegs(){
   let h='<div class="leg head"><span>方向</span><span>类型</span><span>行权价</span><span>张数</span><span>到期日</span><span>成交价格</span><span></span></div>';
   legs.forEach(function(l,i){
-    const ks=strikesOf(l.exp,l.type); if(ks.indexOf(l.K)<0) l.K=near(ks,l.K);
+    const tsel='<select id="lg-'+i+'-type" aria-label="类型"><option value="C"'+(l.type==='C'?' selected':'')+'>Call</option><option value="P"'+(l.type==='P'?' selected':'')+'>Put</option><option value="S"'+(l.type==='S'?' selected':'')+'>股票</option></select>';
+    const ssel='<select id="lg-'+i+'-side" aria-label="方向"><option value="1"'+(l.side>0?' selected':'')+'>买入</option><option value="-1"'+(l.side<0?' selected':'')+'>卖出</option></select>';
+    const rm='<button class="x" id="lg-'+i+'-rm" type="button" aria-label="删除这条腿"'+(legs.length<2?' disabled':'')+'>×</button>';
+    if(l.type==='S'){
+      h+='<div class="leg">'+ssel+tsel+'<select disabled aria-label="行权价"><option>不适用</option></select>'+
+        '<input id="lg-'+i+'-qty" aria-label="张数" type="number" min="1" max="50" step="1" value="'+l.qty+'">'+
+        '<select disabled aria-label="到期日"><option>不适用</option></select>'+
+        '<span class="px">$'+f2(info[l.exp].F)+'　按参考价，1 张 = 100 股</span>'+rm+'</div>';
+      return;
+    }
+    const ks=strikesOf(l.exp,l.type); if(ks.indexOf(l.K)<0) l.K=near(ks,l.K==null?info[l.exp].F:l.K);
     const r=look[l.exp+'|'+l.K+'|'+l.type], p=r?legPrice(r,l.side,useMid):null;
     const q=r && r[4]!=null && r[5]!=null && r[5]>=r[4] && r[5]>0;
     h+='<div class="leg">'+
@@ -1590,7 +1637,8 @@ function update(resetWhat){
     (a.dnInf?'注意：这个组合有裸卖的 Call，标的大涨时亏损没有上限。':'');
   $('leg-note').textContent=R.noQuote?('有 '+R.noQuote+' 条腿没有买卖报价，用的是最新成交价，结果可能不准。'):'';
   const rr=(!a.upInf && !a.dnInf && a.min<0)?a.max/Math.abs(a.min):null;
-  let h=tile(a.cost>=0?'开仓付出':'开仓收入',usd(a.cost),a.cost>=0?'买方组合：先付钱，最多亏掉这笔钱'+(a.dnInf?'':'')+'':'卖方组合：先收钱，这笔钱就是最多能赚的','',true);
+  const hasStock=R.legs.some(l=>l.stock);
+  let h=tile(a.cost>=0?'开仓付出':'开仓收入',usd(a.cost),hasStock?'包含买卖股票的金额（按参考价，每张 100 股）':(a.cost>=0?'买方组合：先付钱，最多亏掉这笔钱':'卖方组合：先收钱，这笔钱就是最多能赚的'),'',true);
   h+=tile('盈利概率（胜率）',(a.pop*100).toFixed(0)+'%','到 '+dstr(R.exp)+' 收盘时赚钱的概率；亏钱的概率是 '+((1-a.pop)*100).toFixed(0)+'%','',true);
   h+=tile('最大盈利',a.upInf?'无上限':sgn(a.max),a.upInf?'标的涨得越多赚得越多':(a.cost>0?'相当于成本的 '+(a.max/a.cost*100).toFixed(0)+'%':''),'up');
   h+=tile('最大亏损',a.dnInf?'无上限':sgn(a.min),a.dnInf?'标的大涨时亏损没有上限':(a.half!=null?'亏掉一半以上最大亏损的概率约 '+(a.half*100).toFixed(0)+'%':''),'down');
@@ -1598,16 +1646,19 @@ function update(resetWhat){
   h=tile('盈亏平衡点',a.be.length?a.be.map(x=>'$'+f2(x)).join(' / '):'无',a.be.length?'距参考价 '+a.be.map(x=>pctOf(x,R.F)).join(' / ')+'；一倍预期波动是 ±'+(R.sigT*100).toFixed(1)+'%':'','sm');
   if(rr!=null) h+=tile('最多赚的是最多亏的几倍',rr.toFixed(2)+' 倍',rr<0.5?'赚得少亏得多，靠高胜率弥补':(rr>2?'亏得少赚得多，但胜率通常低':'赚和亏的幅度接近'));
   h+=tile('按市场定价的平均结果',sgn(a.ev),'把每种结果的金额乘以概率加总。通常是小的负数，差额主要是买卖价差',a.ev>=0?'up':'down');
-  const now=S=>R.legs.reduce((s,l)=>s+l.m*black(S,l.K,l.T/365,l.iv,l.call),0)*100;
+  const now=S=>R.legs.reduce((s,l)=>s+l.m*(l.stock?S:black(S,l.K,l.T/365,l.iv,l.call)),0)*100;
   const d=(now(R.F*1.005)-now(R.F*0.995))/(R.F*0.01);
-  const th=R.legs.reduce((s,l)=>s+l.m*(black(R.F,l.K,Math.max(l.T-1,0)/365,l.iv,l.call)-black(R.F,l.K,l.T/365,l.iv,l.call)),0)*100;
-  const ve=R.legs.reduce((s,l)=>s+l.m*(black(R.F,l.K,l.T/365,l.iv+0.01,l.call)-black(R.F,l.K,l.T/365,l.iv,l.call)),0)*100;
+  const opt=R.legs.filter(l=>!l.stock);
+  const th=opt.reduce((s,l)=>s+l.m*(black(R.F,l.K,Math.max(l.T-1,0)/365,l.iv,l.call)-black(R.F,l.K,l.T/365,l.iv,l.call)),0)*100;
+  const ve=opt.reduce((s,l)=>s+l.m*(black(R.F,l.K,l.T/365,l.iv+0.01,l.call)-black(R.F,l.K,l.T/365,l.iv,l.call)),0)*100;
   h+=tile('标的涨 $1 的盈亏（Delta）',sgn(d),Math.abs(d)<8?'几乎不赌方向':(d>0?'偏看涨':'偏看跌'));
   h+=tile('过一天的盈亏（Theta）',sgn(th),th>1?'时间流逝对它有利':(th<-1?'时间流逝对它不利':'时间影响很小'));
   h+=tile('隐含波动率升 1 点的盈亏（Vega）',sgn(ve),ve>1?'波动率上升对它有利':(ve<-1?'波动率下降对它有利':'波动率影响很小'));
   $('t-more').innerHTML=h;
+  $('bt-out').innerHTML=''; $('bt-years').innerHTML=''; $('bt-note').textContent='';
   if(resetWhat){
-    const ks=R.legs.map(l=>l.K), lo=Math.min(R.F-3*R.move,Math.min(...ks)-0.5*R.move), hi=Math.max(R.F+3*R.move,Math.max(...ks)+0.5*R.move);
+    const ks=R.legs.filter(l=>!l.stock).map(l=>l.K); if(!ks.length) ks.push(R.F);
+    const lo=Math.min(R.F-3*R.move,Math.min(...ks)-0.5*R.move), hi=Math.max(R.F+3*R.move,Math.max(...ks)+0.5*R.move);
     $('w-s').min=Math.max(lo,0.01).toFixed(2); $('w-s').max=hi.toFixed(2); $('w-s').step=((hi-lo)/400).toFixed(3); $('w-s').value=R.F.toFixed(2);
     $('w-v').value=0; $('w-t').max=R.Tn; $('w-t').value=0;
   }
@@ -1615,7 +1666,7 @@ function update(resetWhat){
 }
 function whatPnl(S){
   const dv=+$('w-v').value/100, el=+$('w-t').value;
-  return R.legs.reduce((s,l)=>s+l.m*(black(S,l.K,Math.max(l.T-el,0)/365,Math.max(l.iv+dv,0.01),l.call)-l.price),0)*100;
+  return R.legs.reduce((s,l)=>s+l.m*((l.stock?S:black(S,l.K,Math.max(l.T-el,0)/365,Math.max(l.iv+dv,0.01),l.call))-l.price),0)*100;
 }
 function what(){
   if(!R) return;
@@ -1661,7 +1712,7 @@ function drawChart(){
   // 参考价和行权价
   g.setLineDash([4,3]); g.strokeStyle=css('--accent'); g.beginPath(); g.moveTo(px(R.F),T); g.lineTo(px(R.F),H-B); g.stroke();
   g.setLineDash([2,3]); g.strokeStyle=muted;
-  [...new Set(R.legs.map(l=>l.K))].forEach(function(k){ if(k<x0||k>x1) return; g.beginPath(); g.moveTo(px(k),T); g.lineTo(px(k),H-B); g.stroke(); });
+  [...new Set(R.legs.filter(l=>!l.stock).map(l=>l.K))].forEach(function(k){ if(k<x0||k>x1) return; g.beginPath(); g.moveTo(px(k),T); g.lineTo(px(k),H-B); g.stroke(); });
   g.setLineDash([]);
   g.font='11px '+css('--font'); g.textBaseline='bottom'; g.textAlign='center'; g.fillStyle=css('--accent');
   g.fillText('参考价 '+f2(R.F),px(R.F),T-4);
@@ -1703,6 +1754,32 @@ $('tpl').addEventListener('click',function(e){
   const t=template(tr.dataset.t,$('exp').value); if(!t) return;
   curTpl=tr.dataset.t; legs=t; renderTemplates(); drawLegs(); update(true);
 });
+function runBacktest(){
+  if(!R) return;
+  const note=$('bt-note'); $('bt-out').innerHTML=''; $('bt-years').innerHTML=''; $('bt-head').innerHTML='';
+  if(R.legs.some(l=>!l.stock && Math.abs(l.T-R.Tn)>1e-6)){ note.textContent='组合里有不同到期日的腿，暂时不支持回测。'; return; }
+  const vol=D.vol||[];
+  if(vol.filter(r=>r[2]!=null).length<300){ note.textContent='没有足够的历史数据。请回到看板点“重新读取”，读取这个代码的价格和隐含波动率历史。'; return; }
+  const N=Math.max(1,Math.round(R.Tn*252/365));
+  const spec=R.legs.map(l=>({m:l.m,stock:!!l.stock,call:l.call,x:l.stock?0:(l.K-R.F)/R.move}));
+  const b=histTest(spec,N,vol);
+  if(b.n<60){ note.textContent='历史样本太少，无法回测。'; return; }
+  const act=b.wins/b.n, pred=b.pred/b.n, p0=b.indepWins/b.indep, ci=1.96*Math.sqrt(Math.max(p0*(1-p0),1e-9)/b.indep), d=act-pred, k=R.F;
+  const near=Math.abs(d)<=Math.max(ci,0.03);
+  note.textContent='共 '+b.n+' 笔，'+b.first+' 到 '+b.last+'，每笔持有 '+N+' 个交易日。金额已按现在的参考价折算。';
+  let h=tile('模拟器现在给出的胜率',(R.a.pop*100).toFixed(0)+'%','按今天的真实报价算出来的','',true);
+  h+=tile('历史上的实际胜率',(act*100).toFixed(0)+'%','同样结构的交易持有到期后真的赚钱的比例',near?'':(d>0?'up':'down'),true);
+  h+=tile('当时预测的平均胜率',(pred*100).toFixed(0)+'%','每笔建仓那天按同样的算法算出的胜率，取平均');
+  h+=tile('实际减去预测',(d>=0?'+':'')+(d*100).toFixed(0)+' 个百分点（误差 ±'+(ci*100).toFixed(0)+'）',near?'在误差范围内，这个组合的胜率可以相信':(d>0?'历史上实际比预测的更容易赚钱':'历史上实际比预测的更难赚钱，现在的胜率要打折扣'),'sm');
+  h+=tile('平均每笔盈亏',sgn(b.sum/b.n*k),'正数说明这个结构在这段历史里长期是赚的',b.sum>=0?'up':'down');
+  h+=tile('赚的时候平均赚',b.wins?sgn(b.sumW/b.wins*k):'无','共 '+b.wins+' 笔','up');
+  h+=tile('亏的时候平均亏',b.n-b.wins?sgn(b.sumL/(b.n-b.wins)*k):'无','共 '+(b.n-b.wins)+' 笔','down');
+  h+=tile('最差的一笔',sgn(b.worst*k),'最好的一笔 '+sgn(b.best*k),'down');
+  $('bt-out').innerHTML=h;
+  $('bt-head').innerHTML='<tr><th>年份</th><th>笔数</th><th>实际胜率</th><th>平均每笔盈亏</th></tr>';
+  $('bt-years').innerHTML=Object.keys(b.years).sort().map(function(y){ const v=b.years[y]; return '<tr><td>'+y+'</td><td>'+v.n+'</td><td>'+(v.wins/v.n*100).toFixed(0)+'%</td><td class="'+(v.sum>=0?'up':'down')+'">'+sgn(v.sum/v.n*k)+'</td></tr>'; }).join('');
+}
+$('bt-run').addEventListener('click',runBacktest);
 function setMode(mid){ useMid=mid; $('pm-ba').setAttribute('aria-pressed',!mid); $('pm-mid').setAttribute('aria-pressed',mid); if(D){ renderTemplates(); drawLegs(); update(false); } }
 $('pm-ba').addEventListener('click',()=>setMode(false));
 $('pm-mid').addEventListener('click',()=>setMode(true));

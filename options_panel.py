@@ -200,7 +200,8 @@ def fetch(ib, symbol, days):
     if ivmap and sorted(ivmap.values())[len(ivmap) // 2] > 3:     # 数值是百分数时换成小数
         ivmap = {k: v / 100 for k, v in ivmap.items()}
     vol_hist = [[b[0][:10], b[4], ivmap.get(b[0][:10])] for b in daily]
-    price = clean(t.marketPrice()) or clean(t.close) or (daily[-1][4] if daily else None)
+    recent = next((bars[k][-1][4] for k in ("15m", "30m", "1h", "1d") if bars.get(k)), None)
+    price = clean(t.marketPrice()) or clean(t.last) or recent or clean(t.close)
     if not price:
         raise RuntimeError("读不到 " + symbol + " 的价格，可能是行情暂时不可用，请稍后重试")
     vol = max(hist_vol([b[4] for b in daily]) * 1.2, 0.12)
@@ -669,10 +670,10 @@ ul{margin:0;padding-left:18px;display:flex;flex-direction:column;gap:4px;font-si
 // 每行: [到期日, 行权价, C/P, 持仓量, 买价, 卖价, 最新价, IV, 成交量]
 
 /*CALC-START*/
-function mid(r){
+function mid(r, strict){
   const b=r[4], a=r[5], l=r[6];
   if(b!=null && a!=null && a>=b && a>0) return (a+b)/2;
-  return l!=null ? l : null;
+  return (!strict && l!=null) ? l : null;   // 没有买卖报价时，宽松模式才用最新成交价
 }
 function profile(rows, lo, hi){
   const c={}, p={};
@@ -710,9 +711,13 @@ function levels(pf, ref, wlo, whi){
           maxPain:ks[mp], callTot:call.reduce((a,b)=>a+b,0), putTot:put.reduce((a,b)=>a+b,0), tot:tot, sum:sum};
 }
 function expected(rows){
-  const C={}, P={};
-  for(const r of rows){ const m=mid(r); if(m==null) continue; (r[2]==='C'?C:P)[r[1]]=m; }
-  const both=Object.keys(C).map(Number).filter(k=>P[k]!=null).sort((a,b)=>a-b);
+  let C={}, P={}, both=[];
+  for(const strict of [true,false]){     // 先只用有买卖报价的合约；不够再放宽
+    C={}; P={};
+    for(const r of rows){ const m=mid(r,strict); if(m==null) continue; (r[2]==='C'?C:P)[r[1]]=m; }
+    both=Object.keys(C).map(Number).filter(k=>P[k]!=null).sort((a,b)=>a-b);
+    if(both.length>=3) break;
+  }
   if(!both.length) return null;
   let kA=both[0];
   for(const k of both) if(Math.abs(C[k]-P[k])<Math.abs(C[kA]-P[kA])) kA=k;
@@ -725,6 +730,8 @@ function expected(rows){
     else if(C[a]!=null && C[b]!=null) v=1+(C[b]-C[a])/(b-a);
     if(v!=null) pts.push([k, Math.min(1,Math.max(0,v))]);
   }
+  const raw=pts.map(p=>p[1]);            // 先取相邻三点的中位数，去掉个别异常报价
+  pts.forEach(function(p,i){ const w=[raw[Math.max(i-1,0)],raw[i],raw[Math.min(i+1,raw.length-1)]].sort((a,b)=>a-b); p[1]=w[1]; });
   let run=0; for(const p of pts){ run=Math.max(run,p[1]); p[1]=run; }
   const q=function(x){
     for(let i=1;i<pts.length;i++){
@@ -737,7 +744,9 @@ function expected(rows){
   };
   const ivs=rows.filter(r=>r[1]===kA && r[7]!=null).map(r=>r[7]);
   const iv=ivs.length?ivs.reduce((a,b)=>a+b,0)/ivs.length:null;
-  return {F:F, kA:kA, straddle:straddle, move:move, lo16:q(0.16), hi84:q(0.84), iv:iv};
+  let lo16=q(0.16), hi84=q(0.84);
+  if(lo16==null || hi84==null || !(lo16<F && F<hi84)){ lo16=null; hi84=null; }   // 结果不合理时不显示
+  return {F:F, kA:kA, straddle:straddle, move:move, lo16:lo16, hi84:hi84, iv:iv};
 }
 function daysTo(exp, generated){
   const t=new Date(+exp.slice(0,4), +exp.slice(4,6)-1, +exp.slice(6,8), 16, 0);
@@ -847,10 +856,11 @@ function render(){
     h+=tile('更宽的范围（约 95% 概率）','$'+f2(ref-2*m)+' – $'+f2(ref+2*m),'两倍幅度，±'+(2*m/ref*100).toFixed(1)+'%，超出这个范围属于少见的大行情');
     if(ex.lo16!=null && ex.hi84!=null)
       h+=tile('考虑偏斜后的范围（68%）','<span class="down">'+pct(ex.lo16,ref)+'</span> / <span class="up">'+pct(ex.hi84,ref)+'</span>','$'+f2(ex.lo16)+' 到 $'+f2(ex.hi84)+'。下跌一侧通常更宽，因为下跌保护更贵');
-    else h+=tile('考虑偏斜后的范围（68%）','数据不足','这个到期日的报价不够密，算不出来');
+    else h+=tile('考虑偏斜后的范围（68%）','数据不足','这个到期日的买卖报价不够完整，算出来的结果不可靠，所以不显示');
     h+=tile('平值跨式价格','$'+f2(ex.straddle),'行权价 '+ex.kA+' 的 Call 加 Put。买入跨式要波动超过这个数才赚钱');
-    h+=tile('平值隐含波动率',ex.iv!=null?(ex.iv*100).toFixed(1)+'%':'无数据',ex.iv!=null?'按它折算的幅度：±$'+f2(ref*ex.iv*Math.sqrt(s.days/365))+'，可以和上面的结果对照':'');
-    h+=tile('参考价（期权反推的标的价格）','$'+f2(ex.F),'最新成交价 $'+f2(D.price)+(Math.abs(ex.F-D.price)/D.price>0.003?'，两者不同是因为取数时间不同':''));
+    if(ex.iv!=null) h+=tile('平值隐含波动率',(ex.iv*100).toFixed(1)+'%','按它折算的幅度：±$'+f2(ref*ex.iv*Math.sqrt(s.days/365))+'，可以和上面的结果对照');
+    else h+=tile('平值隐含波动率（按跨式价格反推）',(m/ref/Math.sqrt(s.days/365)*100).toFixed(1)+'%','IBKR 没有给出这个到期日的隐含波动率，这里用跨式价格换算成年化');
+    h+=tile('参考价（期权反推的标的价格）','$'+f2(ex.F),'最新价 $'+f2(D.price)+(Math.abs(ex.F-D.price)/D.price>0.003?'，两者不同是因为取数时间不同，以参考价为准':''));
     h+=tile('平均每天的波动','±'+(m/ref*100/Math.sqrt(Math.max(s.days,1))).toFixed(2)+'%','把这段时间的幅度折算到单日');
   } else h=tile('预期波动幅度','无数据','结束日这个到期日没有可用的买卖报价');
   $('t-move').innerHTML=h;

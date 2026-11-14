@@ -77,6 +77,20 @@ python backtest_range.py --demo     # 不连接 IBKR，用模拟数据看报告�
 
 这个回测只检验范围的宽窄，不涉及涨跌方向，也不检验 Call 墙、Put 墙等持仓价位（后者需要历史持仓量数据）。
 
+## 策略胜率回测
+
+`backtest_strategies.py` 用来检验模拟器里的“盈利概率”准不准：对过去每一个交易日，按和模拟器相同的规则建一遍 11 种常见策略，记下当时预测的胜率，再看持有到期时实际赚没赚。
+
+```
+python backtest_strategies.py            # 回测 QQQ，最近 5 年
+python backtest_strategies.py NVDA       # 回测别的代码
+python backtest_strategies.py --demo     # 不连接 IBKR，用模拟数据看报告的样子
+```
+
+报告给出每种策略的预测胜率、实际胜率、平均每笔盈亏、赚和亏时的平均金额、最差的一笔，以及各年的实际胜率。
+
+期权价格是按当天的隐含波动率用公式算出来的理论价，不是当时的真实成交价，也没有计入买卖价差和手续费，所以它检验的是胜率的算法，不能当作真实交易的收益。
+
 ## 设置
 
 在 `options_panel.py` 开头可以修改：

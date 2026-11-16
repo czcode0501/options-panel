@@ -225,14 +225,48 @@ def fetch(ib, symbol, days):
     if not expiries:
         raise RuntimeError(symbol + " 在未来 " + str(days) + " 天内没有到期的期权，请把读取范围调大")
 
-    contracts = []
+    # 第一步：列出每个到期日的全部合约
+    listed = {}
     for n, (e, d) in enumerate(expiries):
         set_state(msg=f"正在查找合约：到期日 {n + 1}/{len(expiries)}")
-        # 每个到期日只读取它自己用得上的行权价范围：越远的到期日范围越宽
-        rng = min(max(2.5 * vol * math.sqrt(max(d, 1) / 365), 0.04), 0.6)
         cds = ib.reqContractDetails(Option(symbol, e, exchange="SMART", currency="USD",
                                            tradingClass=chain.tradingClass))
-        cs = [cd.contract for cd in cds if abs(cd.contract.strike - price) <= price * rng]
+        listed[e] = [cd.contract for cd in cds]
+
+    # 第二步：先读每个到期日平值附近的一对 Call 和 Put，得到市场对这个到期日的预期波动。
+    # 财报前这个幅度会远大于历史波动，只按历史波动定范围会漏掉需要的行权价。
+    implied = {}
+    try:
+        set_state(msg="正在读取各到期日的预期波动")
+        probe = []
+        for e, _ in expiries:
+            ks = sorted({c.strike for c in listed[e]})
+            if ks:
+                k0 = min(ks, key=lambda k: abs(k - price))
+                probe += [c for c in listed[e] if c.strike == k0]
+        for i in range(0, len(probe), BATCH):
+            tks = [ib.reqMktData(c, "") for c in probe[i:i + BATCH]]
+            ib.sleep(2.5)
+            for tk in tks:
+                b, a = clean(tk.bid), clean(tk.ask)
+                px = (a + b) / 2 if (a and b is not None and a >= b) else (clean(tk.last) or clean(tk.close))
+                if px:
+                    e = tk.contract.lastTradeDateOrContractMonth
+                    implied[e] = implied.get(e, 0) + px
+                ib.cancelMktData(tk.contract)
+    except ConnectionError:
+        raise
+    except Exception:
+        implied = {}
+
+    # 第三步：按“历史波动”和“市场预期波动”里较大的那个确定每个到期日要读的行权价范围
+    contracts = []
+    for e, d in expiries:
+        rng = 2.5 * vol * math.sqrt(max(d, 1) / 365)
+        if implied.get(e):
+            rng = max(rng, 2.7 * implied[e] * 1.25 / price)     # 跨式价格 × 1.25 约为一倍预期波动
+        rng = min(max(rng, 0.04), 0.6)
+        cs = [c for c in listed[e] if abs(c.strike - price) <= price * rng]
         if d > 45:   # 远期合约只保留 5 的整数倍行权价，减少读取量
             thin = [c for c in cs if c.strike % 5 == 0]
             if len(thin) >= 20:

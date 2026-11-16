@@ -1338,6 +1338,8 @@ tr.pick:hover td{background:var(--accent-soft)}
 tr.cur td{background:var(--accent-soft);font-weight:600}
 .warn{color:var(--down)}
 .say{font-size:15px;max-width:95ch}
+#combo{scroll-margin-top:12px;transition:box-shadow .6s, border-color .6s}
+#combo.flash{border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-soft)}
 </style>
 </head>
 <body>
@@ -1360,13 +1362,13 @@ tr.cur td{background:var(--accent-soft);font-weight:600}
 
   <div id="body" class="empty">
   <section class="panel">
-    <h2>常见策略一览（点一行载入下面的组合）</h2>
+    <h2>常见策略一览（点任意一行，下面的“当前组合”就换成这个策略）</h2>
     <div class="tablewrap"><table><thead><tr><th>策略</th><th>开仓</th><th>最大盈利</th><th>最大亏损</th><th>盈利概率</th><th>盈亏平衡点</th><th>怎样才赚钱</th></tr></thead><tbody id="tpl"></tbody></table></div>
     <p class="sub">每个策略的行权价按这个到期日的预期波动幅度自动选取：平值指最接近参考价的行权价，价外的腿放在大约一倍预期波动的位置。金额是一组（每条腿一张）的美元数。</p>
   </section>
 
-  <section class="panel">
-    <h2>当前组合</h2>
+  <section class="panel" id="combo">
+    <h2 id="combo-title">当前组合</h2>
     <div class="legs" id="legs"></div>
     <div class="row"><button class="btn" id="add" type="button">加一条腿</button><span class="sub" id="leg-note"></span></div>
     <p class="say" id="say"></p>
@@ -1663,6 +1665,8 @@ function drawLegs(){
   $('legs').innerHTML=h; $('add').disabled=legs.length>=6;
 }
 function update(resetWhat){
+  const nm=TPL.find(t=>t[0]===curTpl);
+  $('combo-title').textContent='当前组合：'+(nm?nm[1]:'自己修改过的组合');
   R=resolve(legs);
   if(!R){ $('say').textContent='这个组合里有合约没有报价，算不出来。换一个行权价或到期日试试。'; $('say').className='say warn'; $('t-main').innerHTML=''; $('t-more').innerHTML=''; $('t-what').innerHTML=''; geo=null; drawChart(); return; }
   const a=analyze(R.legs,R.F,R.sigT,R.Tn); R.a=a;
@@ -1787,6 +1791,9 @@ $('tpl').addEventListener('click',function(e){
   const tr=e.target.closest('tr.pick'); if(!tr) return;
   const t=template(tr.dataset.t,$('exp').value); if(!t) return;
   curTpl=tr.dataset.t; legs=t; renderTemplates(); drawLegs(); update(true);
+  // 跳到“当前组合”，并闪一下边框，让人看到它已经换成了刚点的策略
+  const c=$('combo'); c.scrollIntoView({behavior:'smooth',block:'start'});
+  c.classList.add('flash'); setTimeout(function(){ c.classList.remove('flash'); },1200);
 });
 function runBacktest(){
   if(!R) return;

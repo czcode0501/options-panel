@@ -60,6 +60,30 @@ def cache_path(symbol):
     return os.path.join(DATA_DIR, f"{symbol.replace(' ', '_')}_{date.today():%Y%m%d}.json")
 
 
+def read_before_todays_open(generated):
+    """现在美股已经开盘，而这份数据是今天开盘前读的：里面还是上一个交易日收盘时的冻结报价。"""
+    try:
+        from zoneinfo import ZoneInfo
+        now = datetime.now(ZoneInfo("America/New_York"))
+        opened = now.replace(hour=9, minute=30, second=0, microsecond=0)
+        if now.weekday() >= 5 or now < opened:
+            return False
+        return datetime.fromisoformat(generated).astimezone(now.tzinfo) < opened
+    except Exception:
+        return False
+
+
+ib_notices = set()   # IBKR 在读取过程中给出的提示，会显示在页面上
+
+
+def on_ib_error(reqId, code, msg, contract=None):
+    if code == 10197:
+        ib_notices.add("IBKR 提示：实盘账户正在别处登录（比如手机 App 或另一台电脑），模拟账户这时收不到行情。"
+                       "退出那边的登录后再点“重新读取”。")
+    elif code in (354, 10090, 10091, 10167, 10168):
+        ib_notices.add("IBKR 提示：账户没有订阅这类实时行情，显示的是延迟约 15 分钟的数据。")
+
+
 def get_cached(symbol, days=0):
     """返回今天已读取的数据；没有或范围不够时返回 None。"""
     with lock:
@@ -77,6 +101,8 @@ def get_cached(symbol, days=0):
     if d is not None and d.get("generated", "")[:10] != date.today().isoformat():
         return None
     if d is not None and d.get("max_days", 0) < days:
+        return None
+    if d is not None and read_before_todays_open(d.get("generated", "")):
         return None
     return d
 
@@ -295,6 +321,10 @@ def fetch(ib, symbol, days):
                          clean(tk.bid), clean(tk.ask), clean(tk.last), iv, clean(tk.volume)])
             ib.cancelMktData(c)
 
+    quoted = sum(1 for r in rows if r[4] is not None or r[6] is not None)
+    if quoted < max(10, 0.05 * len(rows)):
+        raise RuntimeError(f"找到了 {len(rows)} 张 {symbol} 的期权合约，但几乎没有拿到报价（只有 {quoted} 张有价格）。"
+                           "通常是 IBKR 这时没有给模拟账户行情。")
     return {"v": 4, "symbol": symbol, "price": price,
             "generated": datetime.now().isoformat(timespec="minutes"),
             "max_days": days, "bars": bars, "vol": vol_hist, "rows": rows}
@@ -365,6 +395,7 @@ def worker():
         asyncio.set_event_loop(asyncio.new_event_loop())
         from ib_async import IB
         ib = IB()
+        ib.errorEvent += on_ib_error
     while True:
         try:
             job = jobs.get(timeout=0.2)
@@ -388,6 +419,7 @@ def worker():
             holder["ev"].set()
             continue
         _, symbol, days = job
+        ib_notices.clear()
         try:
             if DEMO:
                 data = demo_fetch(symbol, days)
@@ -401,6 +433,7 @@ def worker():
                                            + str(IB_PORT) + "，然后点“重新读取”")
                     ib.reqMarketDataType(MARKET_DATA_TYPE)
                 data = fetch(ib, symbol, days)
+            data["notice"] = " ".join(sorted(ib_notices))
             with lock:
                 cache[symbol] = data
             with open(cache_path(symbol), "w", encoding="utf-8") as f:
@@ -415,6 +448,8 @@ def worker():
                     ib.disconnect()
                 except Exception:
                     pass
+            if ib_notices:
+                msg += " " + " ".join(sorted(ib_notices))
             set_state(status="error", error=msg, msg="")
             print(time.strftime("%H:%M:%S"), symbol, "failed:", msg)
 
@@ -869,7 +904,7 @@ function init(){
   byExp={}; for(const r of D.rows){ (byExp[r[0]]=byExp[r[0]]||[]).push(r); }
   $('title').textContent=D.symbol+' 期权持仓看板'; document.title=D.symbol+' 期权持仓看板';
   const age=Math.round((Date.now()-new Date(D.generated))/60000);
-  setStatus('ready','数据读取于 '+D.generated.replace('T',' ')+(age>=1?'（'+(age>=60?Math.floor(age/60)+' 小时 ':'')+age%60+' 分钟前）':'')+' · 最新价 $'+f2(D.price)+' · '+expiries.length+' 个到期日，'+D.rows.length+' 张合约 · 已读取未来 '+D.max_days+' 天内到期的期权。想更新数据点“重新读取”。');
+  setStatus('ready','数据读取于 '+D.generated.replace('T',' ')+(age>=1?'（'+(age>=60?Math.floor(age/60)+' 小时 ':'')+age%60+' 分钟前）':'')+' · 最新价 $'+f2(D.price)+' · '+expiries.length+' 个到期日，'+D.rows.length+' 张合约 · 已读取未来 '+D.max_days+' 天内到期的期权。想更新数据点“重新读取”。'+(D.notice?' '+D.notice:''));
   $('body').classList.remove('empty');
   if([...$('days').options].some(o=>+o.value===D.max_days)) $('days').value=D.max_days;
   $('e0').max=$('e1').max=Math.max(expiries.length-1,0);

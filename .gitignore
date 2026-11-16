@@ -16,3 +16,12 @@ Thumbs.db
 .idea/
 .vscode/
 .spyproject/
+
+# 学校数据库等外部下载的数据，只能个人使用，不上传
+*.csv
+*.csv.gz
+*.zip
+*.gz
+*.sas7bdat
+*.parquet
+wrds_data/

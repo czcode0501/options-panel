@@ -10,8 +10,9 @@
 import sys, math
 from datetime import date
 
-PORT = 4002
-SYMBOL = (sys.argv[1] if len(sys.argv) > 1 else "QQQ").upper()
+PORTS = [int(sys.argv[sys.argv.index("--port") + 1])] if "--port" in sys.argv else [4002, 4001, 7497, 7496]
+ARGS = [a for i, a in enumerate(sys.argv[1:], 1) if a != "--port" and sys.argv[i - 1] != "--port"]
+SYMBOL = (ARGS[0] if ARGS else "QQQ").upper()
 TYPES = {1: "实时", 2: "冻结", 3: "延迟", 4: "延迟冻结"}
 
 from ib_async import IB, Stock, Option, util
@@ -36,12 +37,20 @@ def show(x):
 
 ib = IB()
 ib.errorEvent += on_error
-print(f"1. 连接 IB Gateway（端口 {PORT}）")
-try:
-    ib.connect("127.0.0.1", PORT, clientId=19, readonly=True, timeout=10)
-except Exception as e:
-    print("   连不上：", type(e).__name__, e)
-    print("   请确认 IB Gateway 已经登录，并且选的是模拟交易（端口 4002）。")
+print("1. 连接 IB Gateway（依次尝试端口 " + "、".join(map(str, PORTS)) + "）")
+for PORT in PORTS:
+    try:
+        ib.connect("127.0.0.1", PORT, clientId=19, readonly=True, timeout=8)
+        print(f"   端口 {PORT} 连上了")
+        break
+    except Exception as e:
+        print(f"   端口 {PORT} 连不上：", type(e).__name__)
+        try:
+            ib.disconnect()
+        except Exception:
+            pass
+else:
+    print("   都连不上。请确认 IB Gateway 已经登录，并在 配置 → 设置 → API → 设置 里勾选了“启用 ActiveX 和套接字客户端”。")
     sys.exit()
 accts = ib.managedAccounts()
 print("   已连接。账户：", ", ".join(accts) or "无",

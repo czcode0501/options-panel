@@ -15,10 +15,13 @@ from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 
 WEB_PORT = 8765          # 看板网页的端口
-IB_PORT = 4002           # IB Gateway 模拟账户 4002；实盘 4001；TWS 模拟 7497
-CLIENT_ID = 11
+IB_PORTS = (4002, 4001, 7497, 7496)   # 依次尝试：Gateway 模拟、Gateway 实盘、TWS 模拟、TWS 实盘
+CLIENT_IDS = range(11, 19)            # 编号被占用时换下一个
 MARKET_DATA_TYPE = 4     # 4 = 没有实时订阅时用延迟/收盘冻结数据
-BATCH = 90               # 账户同时只能订阅约 100 张合约，所以分批读取
+BATCH = 80               # 账户同时只能订阅约 100 条行情，所以分批读取，留一点余量
+REQUEST_TIMEOUT = 30     # 单个请求最多等多少秒，IBKR 不回应时不会一直卡住
+MAX_RECONNECT = 4        # 读取中途断线时最多自动重连几次
+NO_QUOTE_WAIT = 600      # 实盘账户在别处登录时，最多等多少秒让你退出那边的登录
 # K 线周期：(看板里的名字, IBKR 的周期, 读取多长的历史)
 # 最后一项是备用的较短历史：较长的那次读取失败时改用它
 BAR_SETS = [("15m", "15 mins", "60 D", "30 D"), ("30m", "30 mins", "120 D", "60 D"),
@@ -26,6 +29,7 @@ BAR_SETS = [("15m", "15 mins", "60 D", "30 D"), ("30m", "30 mins", "120 D", "60 
 # 可以在看板里选来对比的波动率指数
 INDEXES = ("VIX", "VXN", "RVX", "VXD", "VIX9D", "VIX3M")
 DEMO = "--demo" in sys.argv   # 演示模式：不连接 IBKR，用模拟数据
+PORT_ARG = int(sys.argv[sys.argv.index("--port") + 1]) if "--port" in sys.argv else None   # 指定端口，例如 --port 4001
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(BASE, "options_data")
@@ -35,6 +39,8 @@ lock = threading.Lock()
 jobs = queue.Queue()
 state = {"symbol": None, "status": "idle", "msg": "", "done": 0, "total": 0, "error": ""}
 cache = {}   # 代码 -> 当天的数据
+conn = {"connected": False, "port": None, "account": ""}   # 和 IB Gateway 的连接情况，显示在页面上
+cancel_flag = threading.Event()
 index_cache = {}   # 指数名 -> (日期, 数据)
 
 
@@ -74,14 +80,18 @@ def read_before_todays_open(generated):
 
 
 ib_notices = set()   # IBKR 在读取过程中给出的提示，会显示在页面上
+ib_codes = set()     # 读取过程中收到的 IBKR 错误编号
 
 
 def on_ib_error(reqId, code, msg, contract=None):
+    ib_codes.add(code)
     if code == 10197:
         ib_notices.add("IBKR 提示：实盘账户正在别处登录（比如手机 App 或另一台电脑），模拟账户这时收不到行情。"
                        "退出那边的登录后再点“重新读取”。")
     elif code in (354, 10090, 10091, 10167, 10168):
         ib_notices.add("IBKR 提示：账户没有订阅这类实时行情，显示的是延迟约 15 分钟的数据。")
+    elif code == 1100:
+        ib_notices.add("IBKR 提示：IB Gateway 和 IBKR 服务器的连接断过一次（通常是网络波动或服务器维护）。")
 
 
 def get_cached(symbol, days=0):
@@ -192,77 +202,153 @@ def hist_vol(closes):
 
 # ---------------------------------------------------------------- 从 IBKR 读取
 
-def fetch(ib, symbol, days):
+class NoQuotes(Exception):
+    """实盘账户在别处登录（10197），模拟账户暂时拿不到行情。"""
+
+
+class Cancelled(Exception):
+    """用户在页面上点了“停止”。"""
+
+
+def check_cancel():
+    if cancel_flag.is_set():
+        raise Cancelled()
+
+
+def retry(fn, *a, tries=3, **kw):
+    """IBKR 偶尔不回应某个请求：超时后再试，连接断开则交给上层重连。"""
+    for n in range(tries):
+        check_cancel()
+        try:
+            return fn(*a, **kw)
+        except ConnectionError:
+            raise
+        except (asyncio.TimeoutError, TimeoutError):
+            if n == tries - 1:
+                raise
+            time.sleep(1 + n)
+
+
+def oi_of(tk):
+    return clean(tk.callOpenInterest if tk.contract.right == "C" else tk.putOpenInterest)
+
+
+def read_quotes(ib, cs):
+    """读一批合约的报价和持仓量。账户同时最多约 100 条行情，读完立刻退订。"""
+    tickers = [ib.reqMktData(c, "101") for c in cs]
+    try:
+        for step in range(12):
+            ib.sleep(0.5)
+            check_cancel()
+            got = sum(1 for tk in tickers if oi_of(tk) is not None)
+            if step >= 2 and got >= 0.95 * len(tickers):
+                break
+        out = []
+        for tk in tickers:
+            c = tk.contract
+            iv = clean(tk.modelGreeks.impliedVol) if tk.modelGreeks else None
+            out.append([c.lastTradeDateOrContractMonth, c.strike, c.right, oi_of(tk),
+                        clean(tk.bid), clean(tk.ask), clean(tk.last), iv, clean(tk.volume)])
+        return out
+    finally:
+        for tk in tickers:
+            try:
+                ib.cancelMktData(tk.contract)
+            except Exception:
+                pass
+        try:
+            ib.sleep(0.3)      # 等退订生效，避免下一批超过行情条数上限（IBKR 错误 101）
+        except Exception:
+            pass
+
+
+def has_quote(r):
+    return r[4] is not None or r[5] is not None or r[6] is not None
+
+
+def fetch(ib, symbol, days, ctx):
+    """读取一个代码的全部数据。ctx 保存已完成的步骤：连接中断重连后从断点继续，不用从头再来。"""
     from ib_async import Stock, Option
 
-    set_state(msg="正在查询 " + symbol + " 的行情和历史价格", done=0, total=0)
-    stk = Stock(symbol, "SMART", "USD")
-    ib.qualifyContracts(stk)
-    if not stk.conId:
-        raise RuntimeError("在 IBKR 里找不到代码 " + symbol + "，请检查拼写（目前只支持美股和 ETF）")
+    if "base" not in ctx:
+        set_state(msg="正在查询 " + symbol + " 的行情和历史价格", done=0, total=0)
+        stk = Stock(symbol, "SMART", "USD")
+        retry(ib.qualifyContracts, stk)
+        if not stk.conId:
+            raise RuntimeError("在 IBKR 里找不到代码 " + symbol + "，请检查拼写（目前只支持美股和 ETF）")
+        t = retry(ib.reqTickers, stk)[0]
+        bar = lambda b: [str(b.date)[:16], b.open, b.high, b.low, b.close, clean(b.volume) or 0]
+        bars = {}
+        for n, (key, size, dur, shorter) in enumerate(BAR_SETS):
+            set_state(msg=f"正在读取 K 线：{n + 1}/{len(BAR_SETS)}")
+            got = []
+            for d in (dur, shorter):
+                check_cancel()
+                try:
+                    got = ib.reqHistoricalData(stk, endDateTime="", durationStr=d, barSizeSetting=size,
+                                               whatToShow="TRADES", useRTH=True, timeout=40)
+                except ConnectionError:
+                    raise
+                except Exception:
+                    got = []
+                if got:
+                    break
+            bars[key] = [bar(b) for b in got]
+        daily = bars["1d"]
+        set_state(msg="正在读取隐含波动率历史")
+        try:
+            ivb = ib.reqHistoricalData(stk, endDateTime="", durationStr="5 Y", barSizeSetting="1 day",
+                                       whatToShow="OPTION_IMPLIED_VOLATILITY", useRTH=True, timeout=40)
+        except ConnectionError:
+            raise
+        except Exception:
+            ivb = []
+        ivmap = {str(b.date)[:10]: b.close for b in ivb if b.close and b.close > 0}
+        if ivmap and sorted(ivmap.values())[len(ivmap) // 2] > 3:     # 数值是百分数时换成小数
+            ivmap = {k: v / 100 for k, v in ivmap.items()}
+        vol_hist = [[b[0][:10], b[4], ivmap.get(b[0][:10])] for b in daily]
+        recent = next((bars[k][-1][4] for k in ("15m", "30m", "1h", "1d") if bars.get(k)), None)
+        price = clean(t.marketPrice()) or clean(t.last) or recent or clean(t.close)
+        if not price:
+            raise RuntimeError("读不到 " + symbol + " 的价格，可能是行情暂时不可用，请稍后重试")
+        vol = max(hist_vol([b[4] for b in daily]) * 1.2, 0.12)
+        ctx["stk"] = stk
+        ctx["base"] = {"price": price, "bars": bars, "vol": vol_hist, "hv": vol}
 
-    t = ib.reqTickers(stk)[0]
-    bar = lambda b: [str(b.date)[:16], b.open, b.high, b.low, b.close, clean(b.volume) or 0]
-    bars = {}
-    for n, (key, size, dur, shorter) in enumerate(BAR_SETS):
-        set_state(msg=f"正在读取 K 线：{n + 1}/{len(BAR_SETS)}")
-        got = []
-        for d in (dur, shorter):
-            try:
-                got = ib.reqHistoricalData(stk, endDateTime="", durationStr=d, barSizeSetting=size,
-                                           whatToShow="TRADES", useRTH=True)
-            except ConnectionError:
-                raise
-            except Exception:
-                got = []
-            if got:
-                break
-        bars[key] = [bar(b) for b in got]
-    daily = bars["1d"]
-    set_state(msg="正在读取隐含波动率历史")
-    try:
-        ivb = ib.reqHistoricalData(stk, endDateTime="", durationStr="5 Y", barSizeSetting="1 day",
-                                   whatToShow="OPTION_IMPLIED_VOLATILITY", useRTH=True)
-    except ConnectionError:
-        raise
-    except Exception:
-        ivb = []
-    ivmap = {str(b.date)[:10]: b.close for b in ivb if b.close and b.close > 0}
-    if ivmap and sorted(ivmap.values())[len(ivmap) // 2] > 3:     # 数值是百分数时换成小数
-        ivmap = {k: v / 100 for k, v in ivmap.items()}
-    vol_hist = [[b[0][:10], b[4], ivmap.get(b[0][:10])] for b in daily]
-    recent = next((bars[k][-1][4] for k in ("15m", "30m", "1h", "1d") if bars.get(k)), None)
-    price = clean(t.marketPrice()) or clean(t.last) or recent or clean(t.close)
-    if not price:
-        raise RuntimeError("读不到 " + symbol + " 的价格，可能是行情暂时不可用，请稍后重试")
-    vol = max(hist_vol([b[4] for b in daily]) * 1.2, 0.12)
+    stk, price, vol = ctx["stk"], ctx["base"]["price"], ctx["base"]["hv"]
 
-    params = [p for p in ib.reqSecDefOptParams(symbol, "", "STK", stk.conId) if p.exchange == "SMART"]
-    if not params:
-        raise RuntimeError(symbol + " 没有可交易的期权")
-    chain = max(params, key=lambda p: len(p.expirations))
-    today = date.today()
-    include_today = datetime.now().hour < 16
-    expiries = []
-    for e in sorted(chain.expirations):
-        d = (date(int(e[:4]), int(e[4:6]), int(e[6:8])) - today).days
-        if (d >= 0 if include_today else d > 0) and d <= days:
-            expiries.append((e, d))
-    if not expiries:
-        raise RuntimeError(symbol + " 在未来 " + str(days) + " 天内没有到期的期权，请把读取范围调大")
+    if "expiries" not in ctx:
+        params = [p for p in retry(ib.reqSecDefOptParams, symbol, "", "STK", stk.conId) if p.exchange == "SMART"]
+        if not params:
+            raise RuntimeError(symbol + " 没有可交易的期权")
+        chain = max(params, key=lambda p: len(p.expirations))
+        today = date.today()
+        include_today = datetime.now().hour < 16
+        expiries = []
+        for e in sorted(chain.expirations):
+            d = (date(int(e[:4]), int(e[4:6]), int(e[6:8])) - today).days
+            if (d >= 0 if include_today else d > 0) and d <= days:
+                expiries.append((e, d))
+        if not expiries:
+            raise RuntimeError(symbol + " 在未来 " + str(days) + " 天内没有到期的期权，请把读取范围调大")
+        ctx["chain"], ctx["expiries"], ctx["listed"] = chain, expiries, {}
 
-    # 第一步：列出每个到期日的全部合约
-    listed = {}
+    chain, expiries, listed = ctx["chain"], ctx["expiries"], ctx["listed"]
+
+    # 第一步：列出每个到期日的全部合约（已列出的到期日不再重复查询）
     for n, (e, d) in enumerate(expiries):
+        if e in listed:
+            continue
         set_state(msg=f"正在查找合约：到期日 {n + 1}/{len(expiries)}")
-        cds = ib.reqContractDetails(Option(symbol, e, exchange="SMART", currency="USD",
-                                           tradingClass=chain.tradingClass))
+        cds = retry(ib.reqContractDetails, Option(symbol, e, exchange="SMART", currency="USD",
+                                                  tradingClass=chain.tradingClass))
         listed[e] = [cd.contract for cd in cds]
 
     # 第二步：先读每个到期日平值附近的一对 Call 和 Put，得到市场对这个到期日的预期波动。
     # 财报前这个幅度会远大于历史波动，只按历史波动定范围会漏掉需要的行权价。
-    implied = {}
-    try:
+    # 这一步也用来尽早发现“拿不到行情”的情况，不用等几千张合约读完才报错。
+    if "contracts" not in ctx:
+        implied = {}
         set_state(msg="正在读取各到期日的预期波动")
         probe = []
         for e, _ in expiries:
@@ -270,64 +356,81 @@ def fetch(ib, symbol, days):
             if ks:
                 k0 = min(ks, key=lambda k: abs(k - price))
                 probe += [c for c in listed[e] if c.strike == k0]
+        probed = []
         for i in range(0, len(probe), BATCH):
-            tks = [ib.reqMktData(c, "") for c in probe[i:i + BATCH]]
-            ib.sleep(2.5)
-            for tk in tks:
-                b, a = clean(tk.bid), clean(tk.ask)
-                px = (a + b) / 2 if (a and b is not None and a >= b) else (clean(tk.last) or clean(tk.close))
-                if px:
-                    e = tk.contract.lastTradeDateOrContractMonth
-                    implied[e] = implied.get(e, 0) + px
-                ib.cancelMktData(tk.contract)
-    except ConnectionError:
-        raise
-    except Exception:
-        implied = {}
+            probed += read_quotes(ib, probe[i:i + BATCH])
+        for r in probed:
+            px = (r[4] + r[5]) / 2 if (r[4] is not None and r[5] is not None and r[5] >= r[4]) else (r[6])
+            if px:
+                implied[r[0]] = implied.get(r[0], 0) + px
+        if probed and not any(has_quote(r) for r in probed) and 10197 in ib_codes:
+            raise NoQuotes()
 
-    # 第三步：按“历史波动”和“市场预期波动”里较大的那个确定每个到期日要读的行权价范围
-    contracts = []
-    for e, d in expiries:
-        rng = 2.5 * vol * math.sqrt(max(d, 1) / 365)
-        if implied.get(e):
-            rng = max(rng, 2.7 * implied[e] * 1.25 / price)     # 跨式价格 × 1.25 约为一倍预期波动
-        rng = min(max(rng, 0.04), 0.6)
-        cs = [c for c in listed[e] if abs(c.strike - price) <= price * rng]
-        if d > 45:   # 远期合约只保留 5 的整数倍行权价，减少读取量
-            thin = [c for c in cs if c.strike % 5 == 0]
-            if len(thin) >= 20:
-                cs = thin
-        contracts += cs
-    if not contracts:
-        raise RuntimeError("没有找到 " + symbol + " 的期权合约")
+        # 第三步：按“历史波动”和“市场预期波动”里较大的那个确定每个到期日要读的行权价范围
+        contracts = []
+        for e, d in expiries:
+            rng = 2.5 * vol * math.sqrt(max(d, 1) / 365)
+            if implied.get(e):
+                rng = max(rng, 2.7 * implied[e] * 1.25 / price)     # 跨式价格 × 1.25 约为一倍预期波动
+            rng = min(max(rng, 0.04), 0.6)
+            cs = [c for c in listed[e] if abs(c.strike - price) <= price * rng]
+            if d > 45:   # 远期合约只保留 5 的整数倍行权价，减少读取量
+                thin = [c for c in cs if c.strike % 5 == 0]
+                if len(thin) >= 20:
+                    cs = thin
+            contracts += cs
+        if not contracts:
+            raise RuntimeError("没有找到 " + symbol + " 的期权合约")
+        ctx["contracts"], ctx["rows"] = contracts, {}
 
-    def oi_of(tk):
-        return clean(tk.callOpenInterest if tk.contract.right == "C" else tk.putOpenInterest)
+    contracts, rows = ctx["contracts"], ctx["rows"]
+    key = lambda c: (c.lastTradeDateOrContractMonth, c.strike, c.right)
 
-    rows = []
+    # 第四步：分批读取报价和持仓量。已经读到的合约保存在 ctx 里，断线重连后只读剩下的
     total = len(contracts)
-    for i in range(0, total, BATCH):
-        set_state(msg="正在读取报价和持仓量", done=i, total=total)
-        tickers = [ib.reqMktData(c, "101") for c in contracts[i:i + BATCH]]
-        for step in range(12):
-            ib.sleep(0.5)
-            got = sum(1 for tk in tickers if oi_of(tk) is not None)
-            if step >= 2 and got >= 0.95 * len(tickers):
-                break
-        for tk in tickers:
-            c = tk.contract
-            iv = clean(tk.modelGreeks.impliedVol) if tk.modelGreeks else None
-            rows.append([c.lastTradeDateOrContractMonth, c.strike, c.right, oi_of(tk),
-                         clean(tk.bid), clean(tk.ask), clean(tk.last), iv, clean(tk.volume)])
-            ib.cancelMktData(c)
+    todo = [c for c in contracts if key(c) not in rows]
+    for i in range(0, len(todo), BATCH):
+        set_state(msg="正在读取报价和持仓量", done=len(rows), total=total)
+        for r in read_quotes(ib, todo[i:i + BATCH]):
+            rows[(r[0], r[1], r[2])] = r
+        if len(rows) <= BATCH and not any(has_quote(r) for r in rows.values()) and 10197 in ib_codes:
+            raise NoQuotes()
 
-    quoted = sum(1 for r in rows if r[4] is not None or r[6] is not None)
-    if quoted < max(10, 0.05 * len(rows)):
-        raise RuntimeError(f"找到了 {len(rows)} 张 {symbol} 的期权合约，但几乎没有拿到报价（只有 {quoted} 张有价格）。"
-                           "通常是 IBKR 这时没有给模拟账户行情。")
-    return {"v": 4, "symbol": symbol, "price": price,
+    # 第五步：第一遍没拿到报价的合约（常见原因是 IBKR 一时没回应）再补读一次
+    if not ctx.get("second_pass"):
+        missing = [c for c in contracts if not has_quote(rows[key(c)])]
+        if 0 < len(missing) <= 0.5 * total:
+            for i in range(0, len(missing), BATCH):
+                set_state(msg=f"补读没拿到报价的合约（{len(missing)} 张）", done=total - len(missing) + i, total=total)
+                for r in read_quotes(ib, missing[i:i + BATCH]):
+                    if has_quote(r) or r[3] is not None:
+                        rows[(r[0], r[1], r[2])] = r
+        ctx["second_pass"] = True
+
+    out = [rows[key(c)] for c in contracts]
+    quoted = sum(1 for r in out if has_quote(r))
+    if quoted < max(10, 0.05 * len(out)):
+        raise RuntimeError(f"找到了 {len(out)} 张 {symbol} 的期权合约，但几乎没有拿到报价（只有 {quoted} 张有价格）。"
+                           "通常是 IBKR 这时没有给这个账户行情，可以运行 python diagnose.py 查看原因。")
+    return build_data(ctx, symbol, days, out)
+
+
+def build_data(ctx, symbol, days, rows):
+    b = ctx["base"]
+    return {"v": 4, "symbol": symbol, "price": b["price"],
             "generated": datetime.now().isoformat(timespec="minutes"),
-            "max_days": days, "bars": bars, "vol": vol_hist, "rows": rows}
+            "max_days": days, "bars": b["bars"], "vol": b["vol"], "rows": rows}
+
+
+def partial_data(ctx, symbol, days):
+    """连接反复中断时，如果大部分合约已经读到，就先保存这部分，不让前面几分钟白读。"""
+    if "contracts" not in ctx or not ctx.get("rows"):
+        return None
+    got = [r for r in ctx["rows"].values() if has_quote(r)]
+    if len(got) < max(20, 0.7 * len(ctx["contracts"])):
+        return None
+    rows = sorted(ctx["rows"].values(), key=lambda r: (r[0], r[1], r[2]))
+    return build_data(ctx, symbol, days, rows)
 
 
 # ---------------------------------------------------------------- 演示数据（不连接 IBKR）
@@ -365,6 +468,7 @@ def demo_fetch(symbol, days):
     for n, (e, d) in enumerate(exps):
         set_state(msg="正在读取报价和持仓量（演示数据）", done=n * 100, total=total)
         time.sleep(0.15)
+        check_cancel()
         rng = min(max(2.5 * vol * math.sqrt(d / 365), 0.04), 0.6)
         k = math.ceil(S * (1 - rng) / step) * step
         while k <= S * (1 + rng):
@@ -389,6 +493,104 @@ def demo_fetch(symbol, days):
 
 # ---------------------------------------------------------------- 后台线程：负责和 IBKR 通信
 
+def connect_ib(ib):
+    """依次尝试常用端口；客户编号被占用（上次的看板没有正常退出）时换一个编号。"""
+    ports = [PORT_ARG] if PORT_ARG else ([conn["port"]] if conn.get("port") else []) + \
+        [p for p in IB_PORTS if p != conn.get("port")]
+    for port in ports:
+        for cid in CLIENT_IDS:
+            ib_codes.discard(326)
+            try:
+                ib.connect("127.0.0.1", port, clientId=cid, readonly=True, timeout=8)
+            except Exception:
+                try:
+                    ib.disconnect()
+                except Exception:
+                    pass
+                if 326 in ib_codes:      # 这个编号正被占用，换下一个
+                    continue
+                break                    # 这个端口没有程序在监听，试下一个端口
+            ib.RequestTimeout = REQUEST_TIMEOUT
+            ib.reqMarketDataType(MARKET_DATA_TYPE)
+            accts = ib.managedAccounts()
+            conn.update(port=port, cid=cid, connected=True,
+                        account="模拟账户" if any(a.startswith("D") for a in accts) else "实盘账户")
+            print(time.strftime("%H:%M:%S"), f"connected to port {port} (client id {cid}, {conn['account']})")
+            return
+    conn["connected"] = False
+    raise RuntimeError("连不上 IB Gateway。请确认它已经登录（窗口里的状态是绿色），并在 配置 → 设置 → API → 设置 里"
+                       "勾选了“启用 ActiveX 和套接字客户端”。看板会自动尝试 4002、4001、7497、7496 这几个端口。")
+
+
+def is_conn_error(e):
+    msg = str(e).lower()
+    return isinstance(e, (ConnectionError, OSError, asyncio.CancelledError)) or "disconnect" in msg or "not connected" in msg
+
+
+def wait(ib, seconds):
+    end = time.time() + seconds
+    while time.time() < end:
+        check_cancel()
+        try:
+            if ib is not None and ib.isConnected():
+                ib.sleep(0.5)
+            else:
+                time.sleep(0.5)
+        except Exception:
+            time.sleep(0.5)
+
+
+def load_symbol(ib, symbol, days):
+    """读取一个代码：断线自动重连并从断点继续；实盘账户在别处登录时暂停等待，退出后自动继续。"""
+    ctx, fails, waited = {}, 0, 0
+    while True:
+        try:
+            if not ib.isConnected():
+                set_state(msg="正在连接 IB Gateway")
+                connect_ib(ib)
+            data = fetch(ib, symbol, days, ctx)
+            for n in [n for n in ib_notices if "别处登录" in n]:   # 已经读到报价，说明那边已经退出，不再显示旧提示
+                ib_notices.discard(n)
+            return data
+        except (Cancelled, RuntimeError):
+            raise
+        except NoQuotes:
+            if waited >= NO_QUOTE_WAIT:
+                raise RuntimeError("等了 " + str(NO_QUOTE_WAIT // 60) + " 分钟，仍然拿不到行情：你的实盘账户正在别处登录"
+                                   "（IBKR Desktop、手机 App、网页版或另一台电脑）。退出那边的登录后点“重新读取”。")
+            ctx.pop("contracts", None)
+            ctx.pop("rows", None)
+            ib_codes.discard(10197)
+            for _ in range(4):
+                set_state(msg=f"暂停中：你的实盘账户正在别处登录（IBKR Desktop、手机 App 或网页版），IBKR 停掉了这边的行情。"
+                              f"退出那边的登录后，看板会自动继续（已等待 {waited} 秒）", done=0, total=0)
+                wait(ib, 5)
+                waited += 5
+        except Exception as e:
+            if not is_conn_error(e):
+                raise
+            fails += 1
+            try:
+                ib.disconnect()
+            except Exception:
+                pass
+            conn["connected"] = False
+            if fails > MAX_RECONNECT:
+                part = partial_data(ctx, symbol, days)
+                if part:
+                    ib_notices.add(f"读取过程中和 IB Gateway 的连接多次中断，只保存了已经读到的 "
+                                   f"{len(part['rows'])} / {len(ctx['contracts'])} 张合约，可以稍后点“重新读取”补全。")
+                    return part
+                raise RuntimeError("和 IB Gateway 的连接反复中断（它可能在自动重启或维护）。"
+                                   "请确认它已登录、状态是绿色，然后点“重新读取”")
+            delay = 5 * fails
+            print(time.strftime("%H:%M:%S"), symbol, f"connection lost ({type(e).__name__}), retry {fails}")
+            for s in range(delay, 0, -1):
+                set_state(msg=f"和 IB Gateway 的连接中断了，{s} 秒后自动重连（第 {fails}/{MAX_RECONNECT} 次），"
+                              f"已读到的数据会保留")
+                wait(None, 1)
+
+
 def worker():
     ib = None
     if not DEMO:
@@ -400,18 +602,20 @@ def worker():
         try:
             job = jobs.get(timeout=0.2)
         except queue.Empty:
-            if ib is not None and ib.isConnected():
+            if ib is not None:
                 try:
-                    ib.sleep(0.05)   # 空闲时保持和 IB Gateway 的连接
+                    if ib.isConnected():
+                        ib.sleep(0.05)   # 空闲时保持和 IB Gateway 的连接
+                    conn["connected"] = ib.isConnected()
                 except Exception:
-                    pass
+                    conn["connected"] = False
             continue
+        cancel_flag.clear()
         if job[0] == "index":          # 从 IBKR 读取一个波动率指数的历史
             _, name, holder = job
             try:
                 if not ib.isConnected():
-                    ib.connect("127.0.0.1", IB_PORT, clientId=CLIENT_ID, readonly=True, timeout=10)
-                    ib.reqMarketDataType(MARKET_DATA_TYPE)
+                    connect_ib(ib)
                 holder["rows"] = fetch_index_ib(ib, name)
                 save_index(name, holder["rows"])
             except Exception as e:
@@ -420,29 +624,27 @@ def worker():
             continue
         _, symbol, days = job
         ib_notices.clear()
+        ib_codes.clear()
+        started = time.time()
         try:
             if DEMO:
                 data = demo_fetch(symbol, days)
             else:
-                if not ib.isConnected():
-                    set_state(msg="正在连接 IB Gateway")
-                    try:
-                        ib.connect("127.0.0.1", IB_PORT, clientId=CLIENT_ID, readonly=True, timeout=10)
-                    except Exception:
-                        raise RuntimeError("连不上 IB Gateway。请确认它已经登录、端口是 "
-                                           + str(IB_PORT) + "，然后点“重新读取”")
-                    ib.reqMarketDataType(MARKET_DATA_TYPE)
-                data = fetch(ib, symbol, days)
+                data = load_symbol(ib, symbol, days)
             data["notice"] = " ".join(sorted(ib_notices))
             with lock:
                 cache[symbol] = data
             with open(cache_path(symbol), "w", encoding="utf-8") as f:
                 json.dump(data, f)
             set_state(status="ready", msg="", error="")
-            print(time.strftime("%H:%M:%S"), symbol, "ok,", len(data["rows"]), "contracts")
+            print(time.strftime("%H:%M:%S"), symbol, "ok,", len(data["rows"]), "contracts,",
+                  round(time.time() - started), "s")
+        except Cancelled:
+            set_state(status="error", error="已停止读取。", msg="")
+            print(time.strftime("%H:%M:%S"), symbol, "cancelled")
         except Exception as e:
             msg = str(e) or type(e).__name__
-            if isinstance(e, (ConnectionError, OSError, asyncio.CancelledError)) or "disconnect" in msg.lower():
+            if is_conn_error(e):
                 msg = "和 IB Gateway 的连接中断了（它可能在自动重启或维护）。请确认它已登录后点“重新读取”"
                 try:
                     ib.disconnect()
@@ -478,9 +680,18 @@ class Handler(BaseHTTPRequestHandler):
             return self.send(PAGE.encode("utf-8"), "text/html; charset=utf-8")
         if u.path == "/sim":
             return self.send(SIM_PAGE.encode("utf-8"), "text/html; charset=utf-8")
+        if u.path == "/easy":
+            try:
+                with open(os.path.join(BASE, "easy_page.html"), encoding="utf-8") as f:
+                    return self.send(f.read().encode("utf-8"), "text/html; charset=utf-8")
+            except OSError:
+                return self.send("缺少 easy_page.html，请运行 git pull 更新".encode("utf-8"), "text/plain; charset=utf-8", 404)
         if u.path == "/api/state":
             with lock:
-                return self.send(dict(state))
+                return self.send(dict(state, ib=dict(conn), demo=DEMO))
+        if u.path == "/api/cancel":
+            cancel_flag.set()
+            return self.send({"ok": True})
         if u.path == "/api/symbols":
             files = sorted((f for f in os.listdir(DATA_DIR) if f.endswith(".json") and not f.startswith("index_")),
                            key=lambda f: os.path.getmtime(os.path.join(DATA_DIR, f)), reverse=True)
@@ -555,6 +766,7 @@ PAGE = r"""<!DOCTYPE html>
     --accent:#6fa4f5; --accent-soft:#1e2c44; --up:#3fc48d; --down:#f0776a; --pain:#b98be6; --poc:#e6b23c; --warn:#f0a94a; color-scheme:dark; }
 }
 *{box-sizing:border-box}
+[hidden]{display:none !important}
 html,body{margin:0}
 body{background:var(--bg);color:var(--ink);font-family:var(--font);font-size:15px;line-height:1.5}
 main{max-width:1360px;margin:0 auto;padding:20px 16px 48px;display:flex;flex-direction:column;gap:16px}
@@ -615,6 +827,7 @@ ul{margin:0;padding-left:18px;display:flex;flex-direction:column;gap:4px;font-si
     <div class="row">
       <h1 id="title">期权持仓看板</h1>
       <a class="btn chip" href="/sim">打开期权模拟器</a>
+      <a class="btn chip" href="/easy">按支撑阻力选方案</a>
       <span class="grow"></span>
       <label class="sub" for="sym">股票代码</label>
       <input id="sym" type="text" value="QQQ" maxlength="10" autocomplete="off" spellcheck="false">
@@ -627,9 +840,11 @@ ul{margin:0;padding-left:18px;display:flex;flex-direction:column;gap:4px;font-si
       </select>
       <button class="btn primary" id="go" type="button">查询</button>
       <button class="btn" id="reload" type="button">重新读取</button>
+      <button class="btn" id="stop" type="button" hidden>停止</button>
     </div>
     <div class="row" id="chips"></div>
     <div id="status">正在启动…</div>
+    <div class="sub" id="conn"></div>
     <div id="bar"><i></i></div>
   </section>
 
@@ -841,7 +1056,7 @@ const $=id=>document.getElementById(id);
 const css=n=>getComputedStyle(document.documentElement).getPropertyValue(n).trim();
 let D=null, expiries=[], byExp={}, state=null, geo=null, hover=null;
 const TFN={'15m':'15 分钟','30m':'30 分钟','1h':'1 小时','2h':'2 小时','1d':'日'};
-let tf='1h', viewN=140, curSymbol='', pendingForce=false, pollTimer=null;
+let tf='1h', viewN=140, curSymbol='', pendingForce=false, pollTimer=null, pollFails=0;
 
 const f2=x=>x.toFixed(2), f0=x=>Math.round(x).toLocaleString('en-US');
 const fvol=v=>v>=1e9?(v/1e9).toFixed(2)+'B':v>=1e6?(v/1e6).toFixed(1)+'M':v>=1e3?(v/1e3).toFixed(0)+'K':String(Math.round(v));
@@ -853,13 +1068,24 @@ const dtxt=d=>d<1?(d*24).toFixed(1)+' 小时后':d.toFixed(1)+' 天后';
 function tile(k,v,d,cls,main){ return '<div class="tile'+(main?' main':'')+'"><span class="k">'+k+'</span><span class="v '+(cls||'')+'">'+v+'</span><span class="d">'+(d||'')+'</span></div>'; }
 
 /* ---------- 和看板程序通信 ---------- */
-async function api(path){ const r=await fetch(path); return r.json(); }
+async function api(path){   // 看板程序偶尔忙不过来时自动再试几次，不立刻报错
+  let err;
+  for(let i=0;i<4;i++){ try{ const r=await fetch(path); return await r.json(); }catch(e){ err=e; await new Promise(ok=>setTimeout(ok,600*(i+1))); } }
+  throw err;
+}
 function setStatus(kind,msg,done,total){
   const s=$('status'); s.className=kind==='error'?'error':''; s.textContent=msg;
   const show=kind==='loading';
   $('bar').style.display=show?'block':'none';
   $('bar').firstChild.style.width=(show && total?Math.round(done/total*100):0)+'%';
   $('go').disabled=$('reload').disabled=show;
+  $('stop').hidden=!show;
+}
+function showConn(s){
+  if(!s || s.demo){ $('conn').textContent=s&&s.demo?'演示模式：没有连接 IBKR，数字没有参考意义':''; return; }
+  const ib=s.ib||{};
+  $('conn').innerHTML=ib.connected?'<span class="up">●</span> 已连接 IB Gateway（端口 '+ib.port+'，'+ib.account+'）'
+    :'<span class="down">●</span> 还没有连接 IB Gateway（查询时会自动连接）';
 }
 async function load(force){
   const sym=$('sym').value.trim().toUpperCase().replace(/\s+/g,' ');
@@ -878,8 +1104,12 @@ function poll(){
   clearTimeout(pollTimer);
   pollTimer=setTimeout(async function(){
     let s;
-    try{ s=await api('/api/state'); }
-    catch(e){ return setStatus('error','看板程序没有响应。请确认启动它的那个黑色窗口还开着，然后刷新这个页面。'); }
+    try{ s=await api('/api/state'); pollFails=0; }
+    catch(e){
+      if(++pollFails<10){ setStatus('loading','暂时连不上看板程序，正在重试（'+pollFails+'/10）…',0,0); return poll(); }
+      return setStatus('error','看板程序没有响应。请确认启动它的那个黑色窗口还开着（窗口标题里如果有“选择”二字，点一下窗口再按回车），然后刷新这个页面。');
+    }
+    showConn(s);
     if(s.status==='loading'){
       const p=s.total?'（'+s.done+' / '+s.total+' 张合约）':'';
       setStatus('loading',(s.symbol===curSymbol?'':'正在读取 '+s.symbol+'，完成后接着读取 '+curSymbol+'。')+s.symbol+'：'+s.msg+p,s.done,s.total);
@@ -1206,6 +1436,9 @@ $('e0').addEventListener('input',render);
 $('e1').addEventListener('input',render);
 $('go').addEventListener('click',()=>load(false));
 $('reload').addEventListener('click',()=>load(true));
+$('stop').addEventListener('click',()=>{ api('/api/cancel').catch(()=>{}); $('status').textContent='正在停止…'; });
+async function refreshConn(){ try{ const s=await fetch('/api/state').then(r=>r.json()); showConn(s); }catch(e){} }
+refreshConn(); setInterval(refreshConn,8000);
 $('days').addEventListener('change',()=>load(false));
 $('sym').addEventListener('keydown',e=>{ if(e.key==='Enter') load(false); });
 $('chips').addEventListener('click',e=>{ const s=e.target.dataset && e.target.dataset.s; if(s){ $('sym').value=s; load(false); } });
@@ -1383,6 +1616,7 @@ tr.cur td{background:var(--accent-soft);font-weight:600}
     <div class="row">
       <h1 id="title">期权模拟器</h1>
       <a class="btn chip" href="/">返回期权看板</a>
+      <a class="btn chip" href="/easy">按支撑阻力选方案</a>
       <span class="grow"></span>
       <label class="sub" for="sym">股票代码</label>
       <select id="sym"></select>
@@ -1560,7 +1794,11 @@ function tile(k,v,d,cls,main){ return '<div class="tile'+(main?' main':'')+'"><s
 
 let D=null, expiries=[], byExp={}, info={}, look={}, legs=[], useMid=false, curTpl=null, R=null, geo=null, hoverX=null;
 
-async function api(path){ const r=await fetch(path); return r.json(); }
+async function api(path){   // 看板程序偶尔忙不过来时自动再试几次，不立刻报错
+  let err;
+  for(let i=0;i<4;i++){ try{ const r=await fetch(path); return await r.json(); }catch(e){ err=e; await new Promise(ok=>setTimeout(ok,600*(i+1))); } }
+  throw err;
+}
 async function start(){
   let list=[]; try{ list=await api('/api/symbols'); }catch(e){}
   let want=''; try{ want=localStorage.getItem('opt_symbol')||''; }catch(e){}
@@ -1873,7 +2111,23 @@ SIM_PAGE = (SIM_PAGE.replace("__CSS__", PAGE.split("<style>")[1].split("</style>
             .replace("__CALC__", PAGE.split("/*CALC-START*/")[1].split("/*CALC-END*/")[0]))
 
 
+def disable_quick_edit():
+    """Windows 的命令行窗口被鼠标点到时会暂停程序（“快速编辑模式”），看板就卡住了。这里把它关掉。"""
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+        k = ctypes.windll.kernel32
+        h = k.GetStdHandle(-10)
+        mode = ctypes.c_uint32()
+        if k.GetConsoleMode(h, ctypes.byref(mode)):
+            k.SetConsoleMode(h, (mode.value & ~0x0040) | 0x0080)
+    except Exception:
+        pass
+
+
 def main():
+    disable_quick_edit()
     url = f"http://127.0.0.1:{WEB_PORT}"
     try:
         server = ThreadingHTTPServer(("127.0.0.1", WEB_PORT), Handler)

@@ -260,6 +260,10 @@ def wait_server(ib=None):
     """IB Gateway 和 IBKR 服务器断开时（1100，或请求没有回应且服务器时间也问不到）暂停，恢复后继续。"""
     ib = ib or IBREF["ib"]
     t0, last_probe = time.time(), time.time()
+    if not server_down.is_set():
+        return
+    with lock:
+        before = state["msg"]
     while server_down.is_set():
         if time.time() - last_probe >= 15:      # 没收到“已恢复”的消息时，自己定时问一次
             last_probe = time.time()
@@ -274,6 +278,7 @@ def wait_server(ib=None):
         set_state(msg=f"暂停中：IB Gateway 和 IBKR 服务器的连接断了（常见于每晚的服务器维护或网络波动），"
                       f"恢复后会自动继续（已等待 {waited} 秒）")
         wait(ib, 2)
+    set_state(msg="已恢复，继续读取" + ("：" + before if before and not before.startswith("暂停中") else ""))
 
 
 def retry(fn, *a, tries=3, **kw):

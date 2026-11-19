@@ -9,7 +9,7 @@
 
 程序窗口要一直开着，关掉窗口看板就停了。数据按“代码 + 日期”保存在 options_data 文件夹里。
 """
-import sys, os, re, csv, json, math, time, queue, random, threading, asyncio, webbrowser, urllib.request
+import sys, os, re, csv, json, math, time, queue, random, logging, threading, asyncio, webbrowser, urllib.request
 from datetime import date, datetime, timedelta
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
@@ -22,6 +22,7 @@ BATCH = 80               # 账户同时只能订阅约 100 条行情，所以分
 REQUEST_TIMEOUT = 30     # 单个请求最多等多少秒，IBKR 不回应时不会一直卡住
 MAX_RECONNECT = 4        # 读取中途断线时最多自动重连几次
 NO_QUOTE_WAIT = 600      # 实盘账户在别处登录时，最多等多少秒让你退出那边的登录
+SERVER_WAIT = 1200       # IB Gateway 和 IBKR 服务器断开时（常见于每晚维护），最多等多少秒让它恢复
 # K 线周期：(看板里的名字, IBKR 的周期, 读取多长的历史)
 # 最后一项是备用的较短历史：较长的那次读取失败时改用它
 BAR_SETS = [("15m", "15 mins", "60 D", "30 D"), ("30m", "30 mins", "120 D", "60 D"),
@@ -41,6 +42,17 @@ state = {"symbol": None, "status": "idle", "msg": "", "done": 0, "total": 0, "er
 cache = {}   # 代码 -> 当天的数据
 conn = {"connected": False, "port": None, "account": ""}   # 和 IB Gateway 的连接情况，显示在页面上
 cancel_flag = threading.Event()
+IBREF = {"ib": None}     # 后台线程里的 IB 连接，等待时用它继续接收 IBKR 的消息
+server_down = threading.Event()   # IB Gateway 报告和 IBKR 服务器断开（1100），恢复（1101/1102）前请求都会卡住
+PORT_FILE = os.path.join(DATA_DIR, "ib_port.txt")    # 记住上次连上的端口，下次直接用
+try:
+    with open(PORT_FILE) as f:
+        conn["port"] = int(f.read().strip())
+except (OSError, ValueError):
+    pass
+# ib_async 自己的日志是英文加转义的中文，而且试探端口时会打印“拒绝连接”，看起来像出错。
+# 看板自己会用中文打印需要的信息，所以把它关掉。
+logging.getLogger("ib_async").setLevel(logging.CRITICAL)
 index_cache = {}   # 指数名 -> (日期, 数据)
 
 
@@ -81,10 +93,26 @@ def read_before_todays_open(generated):
 
 ib_notices = set()   # IBKR 在读取过程中给出的提示，会显示在页面上
 ib_codes = set()     # 读取过程中收到的 IBKR 错误编号
+printed_codes = set()
 
 
 def on_ib_error(reqId, code, msg, contract=None):
     ib_codes.add(code)
+    if code in (1100, 2110):
+        if not server_down.is_set():
+            print(time.strftime("%H:%M:%S"), "IB Gateway lost its connection to IBKR servers (1100), waiting for it to come back")
+        server_down.set()
+    elif code in (1101, 1102, 2104, 2106, 2158):
+        if server_down.is_set():
+            print(time.strftime("%H:%M:%S"), "IB Gateway is connected to IBKR servers again")
+        server_down.clear()
+    elif code == 10197 and 10197 not in printed_codes:
+        print(time.strftime("%H:%M:%S"), "IBKR 10197: live account is logged in elsewhere, no market data")
+    elif code == 326:
+        pass
+    elif reqId == -1 and code not in printed_codes and code >= 1000 and code not in (2104, 2106, 2158, 2107, 2108, 2119):
+        print(time.strftime("%H:%M:%S"), "IBKR notice", code)
+    printed_codes.add(code)
     if code == 10197:
         ib_notices.add("IBKR 提示：实盘账户正在别处登录（比如手机 App 或另一台电脑），模拟账户这时收不到行情。"
                        "退出那边的登录后再点“重新读取”。")
@@ -215,18 +243,37 @@ def check_cancel():
         raise Cancelled()
 
 
+def wait_server(ib=None):
+    """IB Gateway 和 IBKR 服务器断开时（1100）暂停，恢复后继续。"""
+    ib = ib or IBREF["ib"]
+    t0 = time.time()
+    while server_down.is_set():
+        waited = int(time.time() - t0)
+        if waited > SERVER_WAIT:
+            raise RuntimeError(f"IB Gateway 和 IBKR 服务器断开了 {SERVER_WAIT // 60} 分钟还没有恢复。请看 IB Gateway 窗口里的连接状态，"
+                               "必要时重新登录，然后点“重新读取”。美东时间每晚 23:45 到次日 1:00 左右常有服务器维护。")
+        set_state(msg=f"暂停中：IB Gateway 和 IBKR 服务器的连接断了（常见于每晚的服务器维护或网络波动），"
+                      f"恢复后会自动继续（已等待 {waited} 秒）")
+        wait(ib, 2)
+
+
 def retry(fn, *a, tries=3, **kw):
-    """IBKR 偶尔不回应某个请求：超时后再试，连接断开则交给上层重连。"""
-    for n in range(tries):
+    """IBKR 偶尔不回应某个请求：超时后再试，连接断开则交给上层重连。服务器断开期间的超时不算次数。"""
+    n = 0
+    while True:
         check_cancel()
+        wait_server()
         try:
             return fn(*a, **kw)
         except ConnectionError:
             raise
         except (asyncio.TimeoutError, TimeoutError):
-            if n == tries - 1:
+            if server_down.is_set():
+                continue
+            n += 1
+            if n >= tries:
                 raise
-            time.sleep(1 + n)
+            time.sleep(n)
 
 
 def oi_of(tk):
@@ -235,6 +282,7 @@ def oi_of(tk):
 
 def read_quotes(ib, cs):
     """读一批合约的报价和持仓量。账户同时最多约 100 条行情，读完立刻退订。"""
+    wait_server(ib)
     tickers = [ib.reqMktData(c, "101") for c in cs]
     try:
         for step in range(12):
@@ -243,6 +291,8 @@ def read_quotes(ib, cs):
             got = sum(1 for tk in tickers if oi_of(tk) is not None)
             if step >= 2 and got >= 0.95 * len(tickers):
                 break
+        if server_down.is_set():          # 这一批读到一半服务器断了：等恢复后整批重读
+            raise TimeoutError()
         out = []
         for tk in tickers:
             c = tk.contract
@@ -277,6 +327,7 @@ def fetch(ib, symbol, days, ctx):
         if not stk.conId:
             raise RuntimeError("在 IBKR 里找不到代码 " + symbol + "，请检查拼写（目前只支持美股和 ETF）")
         t = retry(ib.reqTickers, stk)[0]
+        wait_server(ib)
         bar = lambda b: [str(b.date)[:16], b.open, b.high, b.low, b.close, clean(b.volume) or 0]
         bars = {}
         for n, (key, size, dur, shorter) in enumerate(BAR_SETS):
@@ -358,7 +409,7 @@ def fetch(ib, symbol, days, ctx):
                 probe += [c for c in listed[e] if c.strike == k0]
         probed = []
         for i in range(0, len(probe), BATCH):
-            probed += read_quotes(ib, probe[i:i + BATCH])
+            probed += retry(read_quotes, ib, probe[i:i + BATCH])
         for r in probed:
             px = (r[4] + r[5]) / 2 if (r[4] is not None and r[5] is not None and r[5] >= r[4]) else (r[6])
             if px:
@@ -391,7 +442,7 @@ def fetch(ib, symbol, days, ctx):
     todo = [c for c in contracts if key(c) not in rows]
     for i in range(0, len(todo), BATCH):
         set_state(msg="正在读取报价和持仓量", done=len(rows), total=total)
-        for r in read_quotes(ib, todo[i:i + BATCH]):
+        for r in retry(read_quotes, ib, todo[i:i + BATCH]):
             rows[(r[0], r[1], r[2])] = r
         if len(rows) <= BATCH and not any(has_quote(r) for r in rows.values()) and 10197 in ib_codes:
             raise NoQuotes()
@@ -402,7 +453,7 @@ def fetch(ib, symbol, days, ctx):
         if 0 < len(missing) <= 0.5 * total:
             for i in range(0, len(missing), BATCH):
                 set_state(msg=f"补读没拿到报价的合约（{len(missing)} 张）", done=total - len(missing) + i, total=total)
-                for r in read_quotes(ib, missing[i:i + BATCH]):
+                for r in retry(read_quotes, ib, missing[i:i + BATCH]):
                     if has_quote(r) or r[3] is not None:
                         rows[(r[0], r[1], r[2])] = r
         ctx["second_pass"] = True
@@ -516,6 +567,11 @@ def connect_ib(ib):
             conn.update(port=port, cid=cid, connected=True,
                         account="模拟账户" if any(a.startswith("D") for a in accts) else "实盘账户")
             print(time.strftime("%H:%M:%S"), f"connected to port {port} (client id {cid}, {conn['account']})")
+            try:
+                with open(PORT_FILE, "w") as f:
+                    f.write(str(port))
+            except OSError:
+                pass
             return
     conn["connected"] = False
     raise RuntimeError("连不上 IB Gateway。请确认它已经登录（窗口里的状态是绿色），并在 配置 → 设置 → API → 设置 里"
@@ -598,6 +654,7 @@ def worker():
         from ib_async import IB
         ib = IB()
         ib.errorEvent += on_ib_error
+        IBREF["ib"] = ib
     while True:
         try:
             job = jobs.get(timeout=0.2)

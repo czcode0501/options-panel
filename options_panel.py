@@ -243,11 +243,30 @@ def check_cancel():
         raise Cancelled()
 
 
+def server_alive(ib):
+    """问 IB Gateway 要一次服务器时间：几秒内答不上来，说明它和 IBKR 服务器之间断了。"""
+    if ib is None or not ib.isConnected():
+        return True
+    try:
+        ib.run(asyncio.wait_for(ib.reqCurrentTimeAsync(), 6))
+        return True
+    except ConnectionError:
+        raise
+    except Exception:
+        return False
+
+
 def wait_server(ib=None):
-    """IB Gateway 和 IBKR 服务器断开时（1100）暂停，恢复后继续。"""
+    """IB Gateway 和 IBKR 服务器断开时（1100，或请求没有回应且服务器时间也问不到）暂停，恢复后继续。"""
     ib = ib or IBREF["ib"]
-    t0 = time.time()
+    t0, last_probe = time.time(), time.time()
     while server_down.is_set():
+        if time.time() - last_probe >= 15:      # 没收到“已恢复”的消息时，自己定时问一次
+            last_probe = time.time()
+            if server_alive(ib):
+                server_down.clear()
+                print(time.strftime("%H:%M:%S"), "IB Gateway answers again, continuing")
+                break
         waited = int(time.time() - t0)
         if waited > SERVER_WAIT:
             raise RuntimeError(f"IB Gateway 和 IBKR 服务器断开了 {SERVER_WAIT // 60} 分钟还没有恢复。请看 IB Gateway 窗口里的连接状态，"
@@ -269,6 +288,10 @@ def retry(fn, *a, tries=3, **kw):
             raise
         except (asyncio.TimeoutError, TimeoutError):
             if server_down.is_set():
+                continue
+            if not server_alive(IBREF["ib"]):    # 不是这一个请求的问题，而是 IB Gateway 和服务器断了
+                print(time.strftime("%H:%M:%S"), "IB Gateway is not answering (its connection to IBKR servers is down), waiting")
+                server_down.set()
                 continue
             n += 1
             if n >= tries:

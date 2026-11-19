@@ -44,6 +44,7 @@ conn = {"connected": False, "port": None, "account": ""}   # 和 IB Gateway 的�
 cancel_flag = threading.Event()
 IBREF = {"ib": None}     # 后台线程里的 IB 连接，等待时用它继续接收 IBKR 的消息
 server_down = threading.Event()   # IB Gateway 报告和 IBKR 服务器断开（1100），恢复（1101/1102）前请求都会卡住
+down_by = {"reason": ""}          # "1100"：Gateway 自己报告的，只认它的“已恢复”消息；"probe"：看板自己判断的
 PORT_FILE = os.path.join(DATA_DIR, "ib_port.txt")    # 记住上次连上的端口，下次直接用
 try:
     with open(PORT_FILE) as f:
@@ -99,6 +100,7 @@ printed_codes = set()
 def on_ib_error(reqId, code, msg, contract=None):
     ib_codes.add(code)
     if code in (1100, 2110):
+        down_by["reason"] = "1100"
         if not server_down.is_set():
             print(time.strftime("%H:%M:%S"), "IB Gateway lost its connection to IBKR servers (1100), waiting for it to come back")
         server_down.set()
@@ -265,7 +267,9 @@ def wait_server(ib=None):
     with lock:
         before = state["msg"]
     while server_down.is_set():
-        if time.time() - last_probe >= 15:      # 没收到“已恢复”的消息时，自己定时问一次
+        # 只有看板自己判断的断开才定时试探；Gateway 报告的 1100 只认它的“已恢复”消息，
+        # 因为断开期间 Gateway 仍然会回答服务器时间，试探会误以为已经恢复
+        if down_by["reason"] == "probe" and time.time() - last_probe >= 15:
             last_probe = time.time()
             if server_alive(ib):
                 server_down.clear()
@@ -274,7 +278,8 @@ def wait_server(ib=None):
         waited = int(time.time() - t0)
         if waited > SERVER_WAIT:
             raise RuntimeError(f"IB Gateway 和 IBKR 服务器断开了 {SERVER_WAIT // 60} 分钟还没有恢复。请看 IB Gateway 窗口里的连接状态，"
-                               "必要时重新登录，然后点“重新读取”。美东时间每晚 23:45 到次日 1:00 左右常有服务器维护。")
+                               "必要时重新登录（手机上如果有 IBKR 双重认证的提示要确认），然后点“重新读取”。美东时间每晚 23:45 到次日 1:00 左右常有服务器维护。"
+                               "另外，同一个用户名只能在一个地方登录：开着两个 IB Gateway、或同时登录了 IBKR Desktop，会互相踢下线。")
         set_state(msg=f"暂停中：IB Gateway 和 IBKR 服务器的连接断了（常见于每晚的服务器维护或网络波动），"
                       f"恢复后会自动继续（已等待 {waited} 秒）")
         wait(ib, 2)
@@ -296,6 +301,7 @@ def retry(fn, *a, tries=3, **kw):
                 continue
             if not server_alive(IBREF["ib"]):    # 不是这一个请求的问题，而是 IB Gateway 和服务器断了
                 print(time.strftime("%H:%M:%S"), "IB Gateway is not answering (its connection to IBKR servers is down), waiting")
+                down_by["reason"] = "probe"
                 server_down.set()
                 continue
             n += 1

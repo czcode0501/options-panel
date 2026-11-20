@@ -332,7 +332,8 @@ def chain_from_details(ib, symbol, price):
     exps, tclass = set(), None
     for k in sorted({round(price), round(price / 5) * 5}):
         try:
-            cds = retry(contract_details, ib, Option(symbol, "", k, "C", "SMART", currency="USD"))
+            cds = retry(lambda c: ib.run(asyncio.wait_for(ib.reqContractDetailsAsync(c), 60)),
+                        Option(symbol, "", k, "C", "SMART", currency="USD"), tries=1)
         except (asyncio.TimeoutError, TimeoutError):
             continue
         for cd in cds:

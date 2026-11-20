@@ -22,6 +22,7 @@ BATCH = 80               # 账户同时只能订阅约 100 条行情，所以分
 REQUEST_TIMEOUT = 30     # 单个请求最多等多少秒，IBKR 不回应时不会一直卡住
 DETAILS_TIMEOUT = 180    # 查一个到期日的合约清单最多等多少秒（月度期权行权价多，IBKR 返回得慢）
 MAX_SLOW = 3             # IBKR 回应太慢时，同一步最多再试几次
+RECHECK_SECONDS = 45     # 等服务器恢复时，每隔多少秒重新连一次 Gateway 看它的真实状态
 MAX_RECONNECT = 4        # 读取中途断线时最多自动重连几次
 NO_QUOTE_WAIT = 600      # 实盘账户在别处登录时，最多等多少秒让你退出那边的登录
 SERVER_WAIT = 1200       # IB Gateway 和 IBKR 服务器断开时（常见于每晚维护），最多等多少秒让它恢复
@@ -46,7 +47,7 @@ conn = {"connected": False, "port": None, "account": ""}   # 和 IB Gateway 的�
 cancel_flag = threading.Event()
 IBREF = {"ib": None}     # 后台线程里的 IB 连接，等待时用它继续接收 IBKR 的消息
 server_down = threading.Event()   # IB Gateway 报告和 IBKR 服务器断开（1100），恢复（1101/1102）前请求都会卡住
-down_by = {"reason": ""}          # "1100"：Gateway 自己报告的，只认它的“已恢复”消息；"probe"：看板自己判断的
+down_by = {"reason": "", "since": None}          # "1100"：Gateway 自己报告的，只认它的“已恢复”消息；"probe"：看板自己判断的
 PORT_FILE = os.path.join(DATA_DIR, "ib_port.txt")    # 记住上次连上的端口，下次直接用
 try:
     with open(PORT_FILE) as f:
@@ -103,7 +104,7 @@ def on_ib_error(reqId, code, msg, contract=None):
     ib_codes.add(code)
     if code in (1100, 2110):
         down_by["reason"] = "1100"
-        if not server_down.is_set():
+        if not server_down.is_set() and down_by["since"] is None:
             print(time.strftime("%H:%M:%S"), "IB Gateway lost its connection to IBKR servers (1100), waiting for it to come back")
         server_down.set()
     elif code in (1101, 1102, 2104, 2106, 2158):
@@ -242,6 +243,10 @@ class Cancelled(Exception):
     """用户在页面上点了“停止”。"""
 
 
+class Recheck(Exception):
+    """等服务器恢复时定时重连一次 Gateway，看它现在的真实状态（重新登录后不会再发“已恢复”消息）。"""
+
+
 def check_cancel():
     if cancel_flag.is_set():
         raise Cancelled()
@@ -263,12 +268,18 @@ def server_alive(ib):
 def wait_server(ib=None):
     """IB Gateway 和 IBKR 服务器断开时（1100，或请求没有回应且服务器时间也问不到）暂停，恢复后继续。"""
     ib = ib or IBREF["ib"]
-    t0, last_probe = time.time(), time.time()
     if not server_down.is_set():
+        down_by["since"] = None
         return
+    t0 = down_by["since"] = down_by["since"] or time.time()
+    started, last_probe = time.time(), time.time()
     with lock:
         before = state["msg"]
     while server_down.is_set():
+        if ib is not None and not ib.isConnected():
+            raise ConnectionError("lost the API connection while waiting")
+        if down_by["reason"] == "1100" and time.time() - started >= RECHECK_SECONDS:
+            raise Recheck()
         # 只有看板自己判断的断开才定时试探；Gateway 报告的 1100 只认它的“已恢复”消息，
         # 因为断开期间 Gateway 仍然会回答服务器时间，试探会误以为已经恢复
         if down_by["reason"] == "probe" and time.time() - last_probe >= 15:
@@ -285,6 +296,7 @@ def wait_server(ib=None):
         set_state(msg=f"暂停中：IB Gateway 和 IBKR 服务器的连接断了（常见于每晚的服务器维护或网络波动），"
                       f"恢复后会自动继续（已等待 {waited} 秒）")
         wait(ib, 2)
+    down_by["since"] = None
     set_state(msg="已恢复，继续读取" + ("：" + before if before and not before.startswith("暂停中") else ""))
 
 
@@ -607,6 +619,7 @@ def connect_ib(ib):
                 break                    # 这个端口没有程序在监听，试下一个端口
             ib.RequestTimeout = REQUEST_TIMEOUT
             ib.reqMarketDataType(MARKET_DATA_TYPE)
+            ib.sleep(1.5)                 # 连上后 Gateway 会先报告它和服务器的状态（例如 1100），先收下
             accts = ib.managedAccounts()
             conn.update(port=port, cid=cid, connected=True,
                         account="模拟账户" if any(a.startswith("D") for a in accts) else "实盘账户")
@@ -654,6 +667,15 @@ def load_symbol(ib, symbol, days):
             return data
         except (Cancelled, RuntimeError):
             raise
+        except Recheck:
+            try:
+                ib.disconnect()
+            except Exception:
+                pass
+            server_down.clear()
+            down_by["reason"] = ""
+            set_state(msg="重新连接 IB Gateway，查看它和 IBKR 服务器是否已经恢复")
+            continue
         except NoQuotes:
             if waited >= NO_QUOTE_WAIT:
                 raise RuntimeError("等了 " + str(NO_QUOTE_WAIT // 60) + " 分钟，仍然拿不到行情：你的实盘账户正在别处登录"

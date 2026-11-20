@@ -324,6 +324,28 @@ def retry(fn, *a, tries=3, **kw):
             time.sleep(n)
 
 
+def chain_from_details(ib, symbol, price):
+    """备用办法：查平值附近一两个行权价在所有到期日的合约，从中得到到期日列表和交易类别。请求很小，返回快。"""
+    from types import SimpleNamespace
+    from ib_async import Option
+    set_state(msg="正在用备用办法读取 " + symbol + " 的期权到期日")
+    exps, tclass = set(), None
+    for k in sorted({round(price), round(price / 5) * 5}):
+        try:
+            cds = retry(contract_details, ib, Option(symbol, "", k, "C", "SMART", currency="USD"))
+        except (asyncio.TimeoutError, TimeoutError):
+            continue
+        for cd in cds:
+            exps.add(cd.contract.lastTradeDateOrContractMonth)
+            if cd.contract.tradingClass == symbol or tclass is None:
+                tclass = cd.contract.tradingClass
+    if not exps:
+        raise RuntimeError("IBKR 没有返回 " + symbol + " 的期权到期日（请求一直没有回应）。"
+                           "请看 IB Gateway 是否为绿色，过几分钟再点“重新读取”。")
+    print(time.strftime("%H:%M:%S"), symbol, "option chain via contract details fallback,", len(exps), "expiries")
+    return SimpleNamespace(expirations=sorted(exps), tradingClass=tclass or symbol)
+
+
 def contract_details(ib, contract):
     """查合约清单。这个请求可能比较慢，单独给更长的等待时间。"""
     return ib.run(asyncio.wait_for(ib.reqContractDetailsAsync(contract), DETAILS_TIMEOUT))
@@ -422,10 +444,18 @@ def fetch(ib, symbol, days, ctx):
     stk, price, vol = ctx["stk"], ctx["base"]["price"], ctx["base"]["hv"]
 
     if "expiries" not in ctx:
-        params = [p for p in retry(ib.reqSecDefOptParams, symbol, "", "STK", stk.conId) if p.exchange == "SMART"]
-        if not params:
+        set_state(msg="正在读取 " + symbol + " 的期权到期日")
+        try:
+            params = [p for p in retry(ib.reqSecDefOptParams, symbol, "", "STK", stk.conId, tries=2)
+                      if p.exchange == "SMART"]
+        except (asyncio.TimeoutError, TimeoutError):
+            params = None                 # 这个请求偶尔一直没有回应，改用下面的备用办法
+        if params:
+            chain = max(params, key=lambda p: len(p.expirations))
+        else:
+            chain = chain_from_details(ib, symbol, price)
+        if not chain.expirations:
             raise RuntimeError(symbol + " 没有可交易的期权")
-        chain = max(params, key=lambda p: len(p.expirations))
         today = date.today()
         include_today = datetime.now().hour < 16
         expiries = []

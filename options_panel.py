@@ -20,6 +20,8 @@ CLIENT_IDS = range(11, 19)            # 编号被占用时换下一个
 MARKET_DATA_TYPE = 4     # 4 = 没有实时订阅时用延迟/收盘冻结数据
 BATCH = 80               # 账户同时只能订阅约 100 条行情，所以分批读取，留一点余量
 REQUEST_TIMEOUT = 30     # 单个请求最多等多少秒，IBKR 不回应时不会一直卡住
+DETAILS_TIMEOUT = 180    # 查一个到期日的合约清单最多等多少秒（月度期权行权价多，IBKR 返回得慢）
+MAX_SLOW = 3             # IBKR 回应太慢时，同一步最多再试几次
 MAX_RECONNECT = 4        # 读取中途断线时最多自动重连几次
 NO_QUOTE_WAIT = 600      # 实盘账户在别处登录时，最多等多少秒让你退出那边的登录
 SERVER_WAIT = 1200       # IB Gateway 和 IBKR 服务器断开时（常见于每晚维护），最多等多少秒让它恢复
@@ -310,6 +312,11 @@ def retry(fn, *a, tries=3, **kw):
             time.sleep(n)
 
 
+def contract_details(ib, contract):
+    """查合约清单。这个请求可能比较慢，单独给更长的等待时间。"""
+    return ib.run(asyncio.wait_for(ib.reqContractDetailsAsync(contract), DETAILS_TIMEOUT))
+
+
 def oi_of(tk):
     return clean(tk.callOpenInterest if tk.contract.right == "C" else tk.putOpenInterest)
 
@@ -424,10 +431,13 @@ def fetch(ib, symbol, days, ctx):
     for n, (e, d) in enumerate(expiries):
         if e in listed:
             continue
-        set_state(msg=f"正在查找合约：到期日 {n + 1}/{len(expiries)}")
-        cds = retry(ib.reqContractDetails, Option(symbol, e, exchange="SMART", currency="USD",
-                                                  tradingClass=chain.tradingClass))
-        listed[e] = [cd.contract for cd in cds]
+        found = []
+        for right in ("C", "P"):        # Call 和 Put 分开查，每次的清单小一半，返回更快
+            set_state(msg=f"正在查找合约：到期日 {n + 1}/{len(expiries)}（{'Call' if right == 'C' else 'Put'}）")
+            cds = retry(contract_details, ib, Option(symbol, e, right=right, exchange="SMART", currency="USD",
+                                                     tradingClass=chain.tradingClass))
+            found += [cd.contract for cd in cds]
+        listed[e] = found
 
     # 第二步：先读每个到期日平值附近的一对 Call 和 Put，得到市场对这个到期日的预期波动。
     # 财报前这个幅度会远大于历史波动，只按历史波动定范围会漏掉需要的行权价。
@@ -632,7 +642,7 @@ def wait(ib, seconds):
 
 def load_symbol(ib, symbol, days):
     """读取一个代码：断线自动重连并从断点继续；实盘账户在别处登录时暂停等待，退出后自动继续。"""
-    ctx, fails, waited = {}, 0, 0
+    ctx, fails, waited, slow = {}, 0, 0, 0
     while True:
         try:
             if not ib.isConnected():
@@ -656,6 +666,26 @@ def load_symbol(ib, symbol, days):
                               f"退出那边的登录后，看板会自动继续（已等待 {waited} 秒）", done=0, total=0)
                 wait(ib, 5)
                 waited += 5
+        except (asyncio.TimeoutError, TimeoutError) as e:
+            if ib.isConnected():          # 连接还在，只是 IBKR 回应太慢：原地再试，已完成的步骤不重做
+                slow += 1
+                if slow > MAX_SLOW:
+                    raise RuntimeError("IBKR 对请求一直没有回应。请看 IB Gateway 窗口里的连接状态是不是绿色，然后点“重新读取”。")
+                print(time.strftime("%H:%M:%S"), symbol, f"IBKR is slow to answer, retry {slow}")
+                set_state(msg=f"IBKR 回应较慢，正在重试（第 {slow}/{MAX_SLOW} 次），已读到的数据会保留")
+                wait(ib, 3)
+                continue
+            e2 = e
+            fails += 1
+            try:
+                ib.disconnect()
+            except Exception:
+                pass
+            conn["connected"] = False
+            if fails > MAX_RECONNECT:
+                raise RuntimeError("和 IB Gateway 的连接反复中断（它可能在自动重启或维护）。"
+                                   "请确认它已登录、状态是绿色，然后点“重新读取”") from e2
+            wait(None, 5 * fails)
         except Exception as e:
             if not is_conn_error(e):
                 raise
